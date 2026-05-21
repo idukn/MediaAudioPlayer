@@ -5,16 +5,27 @@
   "main": "src/main.js",
   "scripts": {
     "start": "electron .",
-    "build:app": "electron-builder --mac --dir"
+    "build:mac": "electron-builder --mac --dir",
+    "build:win": "electron-builder --win --x64",
+    "build:win:portable": "electron-builder --win portable --x64",
+    "build:linux": "electron-builder --linux --x64",
+    "build:desktop": "node scripts/build-desktop.js"
   },
   "build": {
     "appId": "local.media.audio.finder",
     "productName": "Media Audio Finder",
+    "asar": true,
     "mac": {
-      "target": [
-        "dir"
-      ],
+      "target": ["dir"],
       "category": "public.app-category.music"
+    },
+    "win": {
+      "target": ["nsis", "portable"],
+      "artifactName": "${productName}-${version}-win-${arch}.${ext}"
+    },
+    "linux": {
+      "target": ["AppImage"],
+      "category": "Audio"
     },
     "directories": {
       "output": "dist"
@@ -23,7 +34,8 @@
       "src/**/*",
       "node_modules/**/*",
       "package.json"
-    ]
+    ],
+    "extraResources": []
   },
   "dependencies": {
     "axios": "^1.13.6",

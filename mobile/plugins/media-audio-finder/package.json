@@ -1,0 +1,20 @@
+{
+  "name": "media-audio-finder-plugin",
+  "version": "1.0.0",
+  "description": "Native bridge for Media Audio Finder on Android",
+  "main": "dist/plugin.cjs.js",
+  "module": "dist/esm/index.js",
+  "types": "dist/esm/index.d.ts",
+  "files": [
+    "android/src/main/",
+    "dist/"
+  ],
+  "peerDependencies": {
+    "@capacitor/core": "^7.0.0"
+  },
+  "capacitor": {
+    "android": {
+      "src": "android"
+    }
+  }
+}

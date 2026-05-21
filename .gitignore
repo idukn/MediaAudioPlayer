@@ -20,6 +20,11 @@ yarn-error.log*
 # Electron
 electron/dist/
 
+# Capacitor / Android
+mobile/node_modules/
+mobile/android/
+mobile/.capacitor/
+
 # OS Files
 .DS_Store
 

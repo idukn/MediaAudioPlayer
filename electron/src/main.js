@@ -4,13 +4,18 @@ const path = require('path');
 const os = require('os');
 const { spawn } = require('child_process');
 const ElectronStore = require('electron-store');
+const syncthingManager = require('./syncthing');
 const Store = ElectronStore.default || ElectronStore;
 const axios = require('axios');
 const cheerio = require('cheerio');
 const express = require('express');
 const fsPromises = require('fs').promises;
-const DEFAULT_SAVE_DIR = '/Volumes/2TB_WINMAC/reference';
-const LEGACY_SAVE_DIR = '/Volumes/WINMAC-2TB/reference';
+const paths = require('./paths');
+const platform = require('./platform');
+
+function getLibraryDir() {
+  return paths.getLibraryDir();
+}
 const AUDIO_EXTS = ['.mp3', '.m4a', '.aac', '.webm', '.wav', '.ogg', '.flac', '.opus', '.wma'];
 const ALLOWED_DOWNLOAD_AUDIO_FORMATS = new Set(['auto', 'mp3', 'm4a', 'wav', 'flac', 'opus']);
 // Bump this when ranking/relevance logic changes to force query cache recomputation.
@@ -36,6 +41,137 @@ function emitEnrichmentStatus() {
       active: metadataEnrichInFlight.size > 0,
       count: metadataEnrichInFlight.size,
     });
+  }
+}
+
+let syncDirWatcher = null;
+let syncDirWatcherTimer = null;
+let currentSaveDir = '';
+let syncthingBootstrapped = false;
+let syncthingBackgroundChain = Promise.resolve();
+
+function getCurrentSaveDir() {
+  return currentSaveDir || getLibraryDir();
+}
+
+function assertPathInLibrary(targetPath) {
+  const libraryDir = path.resolve(getCurrentSaveDir());
+  const resolved = path.resolve(targetPath);
+  if (!isPathWithin(libraryDir, resolved)) {
+    throw new Error('ライブラリ外のパスは操作できません。再生する場合はライブラリにコピーしてください。');
+  }
+  return resolved;
+}
+
+function migrateLibraryData(libraryDir) {
+  const libraryPlaylist = path.join(libraryDir, 'playlists.json');
+  if (fs.existsSync(libraryPlaylist)) {
+    return;
+  }
+
+  const legacyFromStore = store.get('saveDir');
+  const candidates = [
+    legacyFromStore,
+    ...paths.getLegacyLibraryDirs(),
+  ].filter((dir) => dir && path.resolve(dir) !== path.resolve(libraryDir));
+
+  for (const legacyDir of candidates) {
+    const legacyPlaylist = path.join(legacyDir, 'playlists.json');
+    if (!fs.existsSync(legacyPlaylist)) {
+      continue;
+    }
+    try {
+      fs.copyFileSync(legacyPlaylist, libraryPlaylist);
+      console.log(`[Library] Migrated playlists.json from ${legacyDir}`);
+      break;
+    } catch (err) {
+      console.error('[Library] Failed to migrate playlists.json:', err.message);
+    }
+  }
+
+  if (legacyFromStore) {
+    store.delete('saveDir');
+  }
+}
+
+function initializeLibrary() {
+  const libraryDir = getLibraryDir();
+  const { normalized } = applySaveDirSync(libraryDir);
+  migrateLibraryData(normalized);
+  if (!syncthingBootstrapped) {
+    syncthingBootstrapped = true;
+    scheduleSyncthingInBackground(normalized, { isFirstBoot: true });
+  }
+  return normalized;
+}
+
+function emitSyncUpdated(payload = {}) {
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win?.webContents || win.isDestroyed()) continue;
+    win.webContents.send('sync:updated', payload);
+  }
+}
+
+function setupSyncDirWatcher() {
+  if (syncDirWatcher) {
+    syncDirWatcher.close();
+    syncDirWatcher = null;
+  }
+
+  const saveDir = getCurrentSaveDir();
+  if (!fs.existsSync(saveDir)) {
+    return;
+  }
+
+  try {
+    syncDirWatcher = fs.watch(saveDir, { recursive: true }, (_event, filename) => {
+      if (!filename) {
+        scheduleSyncDirChange({ type: 'dir' });
+        return;
+      }
+      const name = String(filename);
+      const lower = name.toLowerCase();
+      if (name === 'playlists.json' || AUDIO_EXTS.some((ext) => lower.endsWith(ext))) {
+        scheduleSyncDirChange({
+          type: name === 'playlists.json' ? 'playlists' : 'audio',
+        });
+      }
+    });
+  } catch (err) {
+    console.error('[Sync] Failed to watch save directory:', err.message);
+  }
+}
+
+function scheduleSyncDirChange(payload) {
+  if (syncDirWatcherTimer) {
+    clearTimeout(syncDirWatcherTimer);
+  }
+  syncDirWatcherTimer = setTimeout(() => {
+    syncDirWatcherTimer = null;
+    emitSyncUpdated(payload);
+  }, 800);
+}
+
+async function updateSyncthingSaveDir(saveDir) {
+  try {
+    await syncthingManager.ensureFolder(saveDir);
+    await syncthingManager.waitForApi();
+    const result = await syncthingManager.runStartupSync({ timeoutMs: 60000 });
+    emitSyncUpdated({ type: 'dir', startup: true, ...result });
+  } catch (err) {
+    console.error('[Syncthing] Failed to update folder path:', err.message);
+  }
+}
+
+async function bootstrapSyncthing(saveDir) {
+  emitSyncUpdated({ type: 'dir', phase: 'syncing', startup: true });
+  try {
+    const result = await syncthingManager.bootstrap(saveDir);
+    emitSyncUpdated({ type: 'dir', phase: 'idle', startup: true, ...result });
+    console.log('[Syncthing] Startup sync finished:', result);
+  } catch (err) {
+    console.error('[Syncthing] Startup sync failed:', err.message);
+    emitSyncUpdated({ type: 'dir', phase: 'error', startup: true, error: err.message });
   }
 }
 
@@ -104,6 +240,7 @@ async function loadCaches() {
 }
 
 app.on('before-quit', () => {
+  syncthingManager.stop();
   try {
     if (CACHE_DIR) {
       fs.mkdirSync(CACHE_DIR, { recursive: true });
@@ -118,10 +255,39 @@ app.on('before-quit', () => {
 const store = new Store({
   name: 'settings',
   defaults: {
-    saveDir: DEFAULT_SAVE_DIR,
     playlists: [],
   },
 });
+
+function applySaveDirSync(dir) {
+  const normalized = ensureWritableDir(dir);
+  const previous = currentSaveDir;
+  currentSaveDir = normalized;
+  setupSyncDirWatcher();
+  return { normalized, previous };
+}
+
+function scheduleSyncthingInBackground(saveDir, { isFirstBoot = false, pathChanged = false } = {}) {
+  if (!isFirstBoot && !pathChanged) {
+    return;
+  }
+
+  const task = async () => {
+    if (isFirstBoot) {
+      await bootstrapSyncthing(saveDir);
+      return;
+    }
+    if (pathChanged) {
+      await updateSyncthingSaveDir(saveDir);
+    }
+  };
+
+  syncthingBackgroundChain = syncthingBackgroundChain
+    .then(task)
+    .catch((err) => {
+      console.error('[Syncthing] Background task failed:', err.message);
+    });
+}
 
 function generatePlaylistId() {
   return `pl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -203,19 +369,52 @@ function normalizePlaylist(rawPlaylist) {
   };
 }
 
-function getStoredPlaylists() {
-  const raw = store.get('playlists');
-  if (!Array.isArray(raw)) {
-    return [];
+function getPlaylistsFilePath() {
+  const saveDir = getCurrentSaveDir();
+  if (!fs.existsSync(saveDir)) {
+    fs.mkdirSync(saveDir, { recursive: true });
   }
-  return raw.map(normalizePlaylist).filter((playlist) => !!playlist);
+  return path.join(saveDir, 'playlists.json');
+}
+
+function getStoredPlaylists() {
+  const filePath = getPlaylistsFilePath();
+  const legacyRaw = store.get('playlists');
+
+  if (Array.isArray(legacyRaw) && legacyRaw.length > 0 && !fs.existsSync(filePath)) {
+    const normalized = legacyRaw.map(normalizePlaylist).filter((playlist) => !!playlist);
+    try {
+      fs.writeFileSync(filePath, JSON.stringify(normalized, null, 2), 'utf-8');
+      store.delete('playlists');
+      return normalized;
+    } catch (e) {
+      console.error('Failed to migrate playlists:', e);
+    }
+  }
+
+  try {
+    if (fs.existsSync(filePath)) {
+      const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+      if (Array.isArray(raw)) {
+        return raw.map(normalizePlaylist).filter((playlist) => !!playlist);
+      }
+    }
+  } catch (err) {
+    console.error('Failed to read playlists.json:', err);
+  }
+  return [];
 }
 
 function setStoredPlaylists(playlists) {
   const normalized = Array.isArray(playlists)
     ? playlists.map(normalizePlaylist).filter((playlist) => !!playlist)
     : [];
-  store.set('playlists', normalized);
+  try {
+    const filePath = getPlaylistsFilePath();
+    fs.writeFileSync(filePath, JSON.stringify(normalized, null, 2), 'utf-8');
+  } catch (err) {
+    console.error('Failed to write playlists.json:', err);
+  }
   return normalized;
 }
 
@@ -267,7 +466,7 @@ function startAudioServer() {
     // Serve files from the save directory using absolute path in query.
     expressApp.get('/audio', (req, res) => {
       const rawPath = req.query.path;
-      const saveDir = store.get('saveDir') || DEFAULT_SAVE_DIR;
+      const saveDir = getCurrentSaveDir();
 
       if (!rawPath || typeof rawPath !== 'string') {
         return res.status(400).send('Missing path');
@@ -377,15 +576,15 @@ function startAudioServer() {
           return res.status(500).send('Dependencies missing');
         }
 
-        // MP3 over chunked HTTP is broadly supported by Chromium audio element.
-        res.setHeader('Content-Type', 'audio/mpeg');
+        const transcodeProfile = await resolvePreviewTranscodeProfile(ffmpeg);
+        res.setHeader('Content-Type', transcodeProfile.contentType);
         res.setHeader('Transfer-Encoding', 'chunked');
         res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
         res.setHeader('Pragma', 'no-cache');
         res.setHeader('Expires', '0');
 
         console.log('[Audio Server] Spawning yt-dlp to ffmpeg pipe for URL:', url);
-        logStreamDebug('[ProxyStream] spawn', { ytdlp, ffmpeg });
+        logStreamDebug('[ProxyStream] spawn', { ytdlp, ffmpeg, profileId: transcodeProfile.id });
         const streamWorkDir = getStreamWorkDir();
         logStreamDebug('[ProxyStream] workdir', { streamWorkDir });
         
@@ -395,7 +594,6 @@ function startAudioServer() {
           '--no-playlist',
           '--no-warnings',
           '-q',
-          '--downloader', 'ffmpeg',
           '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
           url
         ], {
@@ -405,14 +603,11 @@ function startAudioServer() {
         ff = spawn(ffmpeg, [
           '-hide_banner',
           '-loglevel', 'error',
+          '-fflags', '+nobuffer',
           '-i', 'pipe:0',
           '-vn',
           '-map_metadata', '-1',
-          '-c:a', 'libmp3lame',
-          '-q:a', '4',
-          '-id3v2_version', '0',
-          '-write_xing', '0',
-          '-f', 'mp3',
+          ...transcodeProfile.ffmpegArgs,
           '-y',
           'pipe:1'
         ], {
@@ -524,7 +719,17 @@ function startAudioServer() {
 
         ff.on('exit', (code, signal) => {
           console.log(`[ProxyStream] ffmpeg exited: code=${code}, signal=${signal}, ffStdinDataReceived=${ffStdinDataReceived}, ffStdoutDataReceived=${ffStdoutDataReceived}`);
-          logStreamDebug('[ProxyStream] ffmpeg exit', { code, signal, ffStdinDataReceived, ffStdoutDataReceived });
+          logStreamDebug('[ProxyStream] ffmpeg exit', { code, signal, ffStdinDataReceived, ffStdoutDataReceived, profileId: transcodeProfile.id });
+          if (!resDataSent && !isEnded) {
+            console.warn('[ProxyStream] ffmpeg exited before producing audio output');
+            if (!res.headersSent) {
+              res.status(500).send('Preview transcode failed');
+            } else {
+              res.end();
+            }
+            cleanup('ffmpeg produced no output');
+            return;
+          }
           if (code !== 0 && code !== null && !isEnded) {
             console.warn(`[ProxyStream] ffmpeg error: code ${code}, signal ${signal}`);
             cleanup('ffmpeg process exit');
@@ -557,56 +762,64 @@ function startAudioServer() {
   });
 }
 
-function resolveFromShell(name) {
-  try {
-    const shell = process.env.SHELL || '/bin/zsh';
-    const child = spawn(shell, ['-lc', `command -v ${name}`], {
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
+const PREVIEW_TRANSCODE_PROFILES = [
+  {
+    id: 'mp3',
+    contentType: 'audio/mpeg',
+    ffmpegArgs: ['-c:a', 'libmp3lame', '-q:a', '4', '-id3v2_version', '0', '-write_xing', '0', '-f', 'mp3'],
+    isAvailable: (encoderText) => encoderText.includes('libmp3lame'),
+  },
+  {
+    id: 'aac-mp4',
+    contentType: 'audio/mp4',
+    ffmpegArgs: ['-c:a', 'aac', '-b:a', '128k', '-movflags', 'frag_keyframe+empty_moov+default_base_moof', '-f', 'mp4'],
+    isAvailable: (encoderText) => /\s+aac(\s|$)/m.test(encoderText) || encoderText.includes('aac_at'),
+  },
+  {
+    id: 'opus-webm',
+    contentType: 'audio/webm',
+    ffmpegArgs: ['-c:a', 'libopus', '-b:a', '96k', '-f', 'webm'],
+    isAvailable: (encoderText) => encoderText.includes('libopus'),
+  },
+  {
+    id: 'wav',
+    contentType: 'audio/wav',
+    ffmpegArgs: ['-c:a', 'pcm_s16le', '-f', 'wav'],
+    isAvailable: () => true,
+  },
+];
 
-    let out = '';
-    child.stdout.on('data', (d) => {
-      out += d.toString();
-    });
+const previewTranscodeCache = new Map();
 
-    return new Promise((resolve) => {
-      child.on('close', (code) => {
-        if (code === 0) {
-          const resolved = out.trim().split('\n')[0];
-          if (resolved && fs.existsSync(resolved)) {
-            resolve(resolved);
-            return;
-          }
-        }
-        resolve(null);
-      });
-      child.on('error', () => resolve(null));
-    });
-  } catch (_e) {
-    return Promise.resolve(null);
+async function resolvePreviewTranscodeProfile(ffmpegPath) {
+  if (previewTranscodeCache.has(ffmpegPath)) {
+    return previewTranscodeCache.get(ffmpegPath);
   }
+
+  let encoderText = '';
+  try {
+    const result = await runCommand(ffmpegPath, ['-hide_banner', '-encoders']);
+    encoderText = `${result.stdout}\n${result.stderr}`;
+  } catch (err) {
+    encoderText = String(err.message || '');
+  }
+
+  const profile = PREVIEW_TRANSCODE_PROFILES.find((candidate) => candidate.isAvailable(encoderText))
+    || PREVIEW_TRANSCODE_PROFILES[PREVIEW_TRANSCODE_PROFILES.length - 1];
+
+  previewTranscodeCache.set(ffmpegPath, profile);
+  logStreamDebug('[ProxyStream] transcode profile', { ffmpegPath, profileId: profile.id, contentType: profile.contentType });
+  return profile;
 }
 
 async function findExecutable(name, extraCandidates = []) {
-  const home = os.homedir();
   const candidates = [
     ...extraCandidates,
-    path.join(home, 'anaconda3', 'bin', name),
-    path.join(home, 'miniconda3', 'bin', name),
-    path.join(home, 'micromamba', 'bin', name),
-    `/opt/homebrew/anaconda3/bin/${name}`,
-    `/opt/homebrew/Caskroom/miniconda/base/bin/${name}`,
-    path.join(home, '.local', 'bin', name),
-    path.join(home, 'Library', 'Python', '3.12', 'bin', name),
-    path.join(home, 'Library', 'Python', '3.11', 'bin', name),
-    `/opt/homebrew/bin/${name}`,
-    `/usr/local/bin/${name}`,
-    `/usr/bin/${name}`,
-    name,
+    ...platform.getExecutableCandidates(name),
   ];
 
   for (const candidate of candidates) {
-    if (candidate === name) {
+    if (candidate === name || candidate === `${name}.exe`) {
       continue;
     }
     if (fs.existsSync(candidate)) {
@@ -621,7 +834,7 @@ async function findExecutable(name, extraCandidates = []) {
     }
   }
 
-  const shellResolved = await resolveFromShell(name);
+  const shellResolved = await platform.resolveFromShell(name);
   if (shellResolved) {
     console.log(`[Deps] Resolved ${name} via shell: ${shellResolved}`);
     logStreamDebug('[Deps] resolved via shell', { name, shellResolved });
@@ -631,9 +844,19 @@ async function findExecutable(name, extraCandidates = []) {
   return name;
 }
 
+function normalizeSaveDir(dir) {
+  const normalized = String(dir || '').trim();
+  if (!normalized) {
+    throw new Error('保存先パスが設定されていません');
+  }
+  return normalized;
+}
+
 function ensureWritableDir(dir) {
-  fs.mkdirSync(dir, { recursive: true });
-  fs.accessSync(dir, fs.constants.W_OK);
+  const normalized = normalizeSaveDir(dir);
+  fs.mkdirSync(normalized, { recursive: true });
+  fs.accessSync(normalized, fs.constants.W_OK);
+  return normalized;
 }
 
 function runCommand(command, args) {
@@ -1466,21 +1689,15 @@ function createWindow() {
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
 }
 
-ipcMain.handle('settings:getSaveDir', () => {
-  return store.get('saveDir');
+ipcMain.handle('settings:getLibraryDir', () => {
+  return getCurrentSaveDir();
 });
 
-ipcMain.handle('settings:setSaveDir', async (_event, dir) => {
-  ensureWritableDir(dir);
-  store.set('saveDir', dir);
-  return dir;
-});
-
-ipcMain.handle('settings:chooseSaveDir', async () => {
+ipcMain.handle('settings:chooseDownloadDir', async () => {
   const result = await dialog.showOpenDialog({
-    title: 'Select Save Folder',
+    title: 'ダウンロード先フォルダを選択',
     properties: ['openDirectory', 'createDirectory'],
-    defaultPath: store.get('saveDir') || DEFAULT_SAVE_DIR,
+    defaultPath: paths.getDefaultDialogPath('downloads'),
   });
 
   if (result.canceled || !result.filePaths[0]) {
@@ -1489,7 +1706,6 @@ ipcMain.handle('settings:chooseSaveDir', async () => {
 
   const chosen = result.filePaths[0];
   ensureWritableDir(chosen);
-  store.set('saveDir', chosen);
   return chosen;
 });
 
@@ -1857,8 +2073,40 @@ ipcMain.handle('download:audio', async (_event, { url, saveDir, audioFormat = 'a
 });
 
 ipcMain.handle('files:listAudio', async (_event, { saveDir }) => {
-  ensureWritableDir(saveDir);
-  return listAudioFiles(saveDir);
+  const normalized = assertPathInLibrary(ensureWritableDir(saveDir));
+  return listAudioFiles(normalized);
+});
+
+ipcMain.handle('files:createFolderAt', async (_event, { parentDir, name }) => {
+  if (!parentDir || typeof parentDir !== 'string') {
+    throw new Error('作成先フォルダが不正です');
+  }
+  if (!name || typeof name !== 'string') {
+    throw new Error('フォルダ名を入力してください');
+  }
+
+  const trimmed = name.trim();
+  if (!trimmed) {
+    throw new Error('フォルダ名を入力してください');
+  }
+  if (trimmed === '.' || trimmed === '..') {
+    throw new Error('そのフォルダ名は使えません');
+  }
+  if (/[\\/]/.test(trimmed)) {
+    throw new Error('フォルダ名に / や \\ は使えません');
+  }
+
+  const resolvedParent = ensureWritableDir(parentDir);
+  const resolvedTarget = path.resolve(path.join(resolvedParent, trimmed));
+  if (!isPathWithin(resolvedParent, resolvedTarget)) {
+    throw new Error('不正なフォルダパスです');
+  }
+  if (fs.existsSync(resolvedTarget)) {
+    throw new Error('同名のファイルまたはフォルダが既に存在します');
+  }
+
+  fs.mkdirSync(resolvedTarget, { recursive: false });
+  return { ok: true, fullPath: resolvedTarget, name: trimmed };
 });
 
 ipcMain.handle('files:createFolder', async (_event, { parentDir, name }) => {
@@ -1880,9 +2128,8 @@ ipcMain.handle('files:createFolder', async (_event, { parentDir, name }) => {
     throw new Error('フォルダ名に / や \\ は使えません');
   }
 
-  ensureWritableDir(parentDir);
-  const targetPath = path.join(parentDir, trimmed);
-  const resolvedParent = path.resolve(parentDir);
+  const resolvedParent = assertPathInLibrary(ensureWritableDir(parentDir));
+  const targetPath = path.join(resolvedParent, trimmed);
   const resolvedTarget = path.resolve(targetPath);
 
   if (!isPathWithin(resolvedParent, resolvedTarget)) {
@@ -1918,8 +2165,7 @@ ipcMain.handle('files:moveToNewFolder', async (_event, { parentDir, folderName, 
     throw new Error('フォルダ名に / や \\ は使えません');
   }
 
-  ensureWritableDir(parentDir);
-  const resolvedParent = path.resolve(parentDir);
+  const resolvedParent = assertPathInLibrary(ensureWritableDir(parentDir));
   const destDir = path.resolve(path.join(resolvedParent, trimmed));
 
   if (!isPathWithin(resolvedParent, destDir)) {
@@ -1966,11 +2212,15 @@ ipcMain.handle('files:moveToNewFolder', async (_event, { parentDir, folderName, 
 });
 
 ipcMain.handle('files:openInFinder', async (_event, { filePath }) => {
-  if (!filePath) {
-    return;
-  }
-  shell.showItemInFolder(filePath);
+  await platform.openPathInFileManager(filePath);
 });
+
+ipcMain.handle('platform:getInfo', () => ({
+  platform: process.platform,
+  platformLabel: platform.getPlatformLabel(),
+  fileManagerLabel: platform.getFileManagerLabel(),
+  libraryDir: getCurrentSaveDir(),
+}));
 
 ipcMain.handle('links:openExternal', async (_event, { url }) => {
   if (!url || typeof url !== 'string') {
@@ -2046,6 +2296,69 @@ ipcMain.handle('playlists:addItems', (_event, { playlistId, items }) => {
   return { ok: true, addedCount, playlist: playlists[index] };
 });
 
+ipcMain.handle('playlists:reorderItems', (_event, { playlistId, fromIndex, toIndex }) => {
+  const targetId = String(playlistId || '').trim();
+  if (!targetId) {
+    throw new Error('プレイリストが不正です');
+  }
+
+  const from = Number(fromIndex);
+  const to = Number(toIndex);
+  if (!Number.isInteger(from) || !Number.isInteger(to)) {
+    throw new Error('並べ替え位置が不正です');
+  }
+
+  const playlists = getStoredPlaylists();
+  const index = playlists.findIndex((playlist) => playlist.id === targetId);
+  if (index < 0) {
+    throw new Error('指定されたプレイリストが見つかりません');
+  }
+
+  const items = playlists[index].items;
+  if (from < 0 || from >= items.length || to < 0 || to >= items.length) {
+    throw new Error('並べ替え位置が不正です');
+  }
+  if (from === to) {
+    return { ok: true, playlist: playlists[index] };
+  }
+
+  const [moved] = items.splice(from, 1);
+  items.splice(to, 0, moved);
+  playlists[index].items = items;
+  setStoredPlaylists(playlists);
+  return { ok: true, playlist: playlists[index] };
+});
+
+ipcMain.handle('playlists:removeItems', (_event, { playlistId, itemIndexes }) => {
+  const targetId = String(playlistId || '').trim();
+  if (!targetId) {
+    throw new Error('プレイリストが不正です');
+  }
+  if (!Array.isArray(itemIndexes) || itemIndexes.length === 0) {
+    throw new Error('削除する曲がありません');
+  }
+
+  const playlists = getStoredPlaylists();
+  const index = playlists.findIndex((playlist) => playlist.id === targetId);
+  if (index < 0) {
+    throw new Error('指定されたプレイリストが見つかりません');
+  }
+
+  const removeSet = new Set(
+    itemIndexes
+      .map((value) => Number(value))
+      .filter((value) => Number.isInteger(value) && value >= 0),
+  );
+  if (removeSet.size === 0) {
+    throw new Error('削除する曲がありません');
+  }
+
+  const items = playlists[index].items.filter((_item, itemIndex) => !removeSet.has(itemIndex));
+  playlists[index].items = items;
+  setStoredPlaylists(playlists);
+  return { ok: true, removedCount: removeSet.size, playlist: playlists[index] };
+});
+
 ipcMain.handle('audio:getServerPort', () => {
   return audioServerPort;
 });
@@ -2079,7 +2392,28 @@ ipcMain.handle('clear:cache', async () => {
   }
 });
 
+ipcMain.handle('syncthing:getInfo', async () => {
+  try {
+    const info = await syncthingManager.getInfo();
+    return { ok: true, ...info };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+ipcMain.handle('syncthing:addDevice', async (_event, { deviceID }) => {
+  try {
+    const res = await syncthingManager.addDevice(deviceID);
+    const info = await syncthingManager.getInfo();
+    return { ...res, info };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
 app.whenReady().then(async () => {
+  paths.setUserDataResolver(() => app.getPath('userData'));
+
   // Start audio streaming server first
   try {
     await startAudioServer();
@@ -2087,17 +2421,15 @@ app.whenReady().then(async () => {
     console.error('[App] Failed to start audio server:', error);
   }
 
-  if (store.get('saveDir') === LEGACY_SAVE_DIR) {
-    store.set('saveDir', DEFAULT_SAVE_DIR);
-  }
-
   try {
-    ensureWritableDir(store.get('saveDir'));
-  } catch (_e) {
-    // Defer to UI handling when default path is not writable.
+    initializeLibrary();
+  } catch (err) {
+    console.error('[Library] Failed to initialize library directory:', err.message);
   }
 
-  await loadCaches();
+  loadCaches().catch((err) => {
+    console.error('[Cache] Failed to load caches on startup:', err.message);
+  });
 
   createWindow();
 
