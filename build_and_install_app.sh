@@ -15,7 +15,7 @@ fi
 
 rm -rf dist
 npm install
-npm run build:app
+npm run build:mac
 
 if [[ -d "$APP_DIR/dist/mac-arm64/$APP_NAME" ]]; then
   BUILT_APP_PATH="$APP_DIR/dist/mac-arm64/$APP_NAME"

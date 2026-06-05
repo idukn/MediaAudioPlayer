@@ -15,12 +15,25 @@
     return plugin[method](payload);
   }
 
+  function extensionOf(filePath) {
+    const match = String(filePath || '').toLowerCase().match(/\.([a-z0-9]+)$/);
+    return match ? match[1] : '';
+  }
+
+  /**
+   * ローカルファイル再生は常にプラグインの /audio サーバを優先する。
+   * convertFileSrc (_capacitor_file_) はファイル名に特殊文字・絵文字を含むと
+   * mediaError=4 になる端末があるため、サーバ経由 (Content-Type + Range) のほうが安定。
+   */
   function buildLocalAudioUrl(fullPath) {
-    if (cachedAudioServerPort > 0 && fullPath) {
+    if (!fullPath) {
+      return fullPath;
+    }
+    if (cachedAudioServerPort > 0) {
       return `http://127.0.0.1:${cachedAudioServerPort}/audio?path=${encodeURIComponent(fullPath)}&t=${Date.now()}`;
     }
     const capacitor = window.Capacitor;
-    if (capacitor?.convertFileSrc && fullPath) {
+    if (capacitor?.convertFileSrc) {
       return capacitor.convertFileSrc(fullPath);
     }
     return fullPath;
@@ -32,6 +45,9 @@
       return res.path;
     },
     getPlatformInfo: () => nativeCall('getPlatformInfo'),
+    getMediaToolsDiagnostics: () => nativeCall('getMediaToolsDiagnostics'),
+    requestTermuxRunPermission: () => nativeCall('requestTermuxRunPermission'),
+    openAppPermissionSettings: () => nativeCall('openAppPermissionSettings'),
     chooseDownloadDir: async () => {
       const res = await nativeCall('chooseDownloadDir');
       return res.path || null;
@@ -44,9 +60,43 @@
       const port = await window.api.getAudioServerPort();
       const url = payload?.url || payload?.webpageUrl;
       if (!port || !url) {
-        throw new Error('試聴ストリームを開始できませんでした');
+        throw new Error('試聴を開始できませんでした');
       }
       return `http://127.0.0.1:${port}/stream?url=${encodeURIComponent(url)}`;
+    },
+    preparePreviewStream: async (payload) => {
+      const port = await window.api.getAudioServerPort();
+      const pageUrl = String(payload?.url || payload?.webpageUrl || '').trim();
+      if (!port || !pageUrl) {
+        throw new Error('試聴を開始できませんでした');
+      }
+      if (window.Capacitor?.getPlatform?.() === 'android' && typeof window.api.requestTermuxRunPermission === 'function') {
+        try {
+          await window.api.requestTermuxRunPermission();
+        } catch (permError) {
+          console.warn('[Preview] Termux permission request:', permError);
+        }
+      }
+      console.log('[Preview] prepare stream:', pageUrl);
+      const prepareUrl = `http://127.0.0.1:${port}/stream/prepare?url=${encodeURIComponent(pageUrl)}`;
+      const response = await fetch(prepareUrl);
+      let data = null;
+      try {
+        data = await response.json();
+      } catch {
+        const text = await response.text().catch(() => '');
+        throw new Error(text || `サーバーエラー (HTTP ${response.status})`);
+      }
+      if (!data?.ok) {
+        throw new Error(data?.error || `サーバーエラー (HTTP ${response.status})`);
+      }
+      if (data.cachePath && window.Capacitor?.convertFileSrc) {
+        return window.Capacitor.convertFileSrc(data.cachePath);
+      }
+      if (data.playUrl) {
+        return data.playUrl;
+      }
+      throw new Error('ストリーム準備の応答が不正です');
     },
     downloadAudio: (payload) => nativeCall('downloadAudio', payload),
     listAudio: async (payload) => {
@@ -73,6 +123,13 @@
       const res = await nativeCall('getAudioServerPort');
       cachedAudioServerPort = Number(res.port) || 0;
       return cachedAudioServerPort;
+    },
+    resolveLibraryPath: async (payload) => {
+      const res = await nativeCall('resolveLibraryPath', payload || {});
+      return {
+        found: Boolean(res.found),
+        path: res.path || '',
+      };
     },
     getStreamLogPath: async () => '(mobile)',
     buildLocalAudioUrl,

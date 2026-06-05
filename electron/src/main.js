@@ -293,6 +293,108 @@ function generatePlaylistId() {
   return `pl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function isAbsoluteLibraryPath(value) {
+  const normalized = String(value || '').replace(/\\/g, '/').trim();
+  return normalized.startsWith('/') || /^[a-zA-Z]:[/\\]/.test(normalized);
+}
+
+/** playlists.json にはライブラリ相対パスのみ保存（Mac/Android 共通）。 */
+function toStorageLibraryPath(fullPath) {
+  const raw = String(fullPath || '').trim();
+  if (!raw) {
+    return '';
+  }
+
+  const libraryDir = path.resolve(getCurrentSaveDir());
+  try {
+    const resolved = path.resolve(raw);
+    if (fs.existsSync(resolved) && isPathWithin(libraryDir, resolved)) {
+      return path.relative(libraryDir, resolved).split(path.sep).join('/');
+    }
+  } catch (_e) {
+    // ignore
+  }
+
+  if (!isAbsoluteLibraryPath(raw)) {
+    return raw.replace(/\\/g, '/').replace(/^\/+/, '');
+  }
+
+  const normalized = raw.replace(/\\/g, '/');
+  const markers = [
+    '/library/',
+    '.media-audio-finder/library/',
+    'media-audio-finder/library/',
+    '/application support/media-audio-finder/library/',
+    '/reference/',
+    '/yt_audio_app/',
+  ];
+  const lower = normalized.toLowerCase();
+  let best = '';
+  for (const marker of markers) {
+    const idx = lower.lastIndexOf(marker);
+    if (idx >= 0) {
+      const rel = normalized.slice(idx + marker.length);
+      if (rel.length > best.length) {
+        best = rel;
+      }
+    }
+  }
+  if (best) {
+    return best.replace(/^\/+/, '');
+  }
+
+  return path.basename(raw);
+}
+
+function expandLibraryPath(storedPath) {
+  const storage = String(storedPath || '').trim();
+  if (!storage) {
+    return null;
+  }
+
+  const libraryDir = getCurrentSaveDir();
+  if (!isAbsoluteLibraryPath(storage)) {
+    const candidate = path.join(libraryDir, storage);
+    if (fs.existsSync(candidate)) {
+      return path.resolve(candidate);
+    }
+  }
+
+  try {
+    const resolved = path.resolve(storage);
+    if (fs.existsSync(resolved) && isPathWithin(libraryDir, resolved)) {
+      return resolved;
+    }
+  } catch (_e) {
+    // ignore
+  }
+
+  const rel = toStorageLibraryPath(storage);
+  if (rel && rel !== storage) {
+    const candidate = path.join(libraryDir, rel);
+    if (fs.existsSync(candidate)) {
+      return path.resolve(candidate);
+    }
+  }
+
+  return null;
+}
+
+function expandPlaylistItemForClient(item) {
+  if (!item || item.type !== 'local') {
+    return item;
+  }
+  const storagePath = String(item.fullPath || '').trim();
+  if (!storagePath) {
+    return item;
+  }
+  const resolved = expandLibraryPath(storagePath);
+  if (!resolved) {
+    return item;
+  }
+  return { ...item, fullPath: resolved };
+}
+
 function normalizePlaylistItem(rawItem) {
   if (!rawItem || typeof rawItem !== 'object') {
     return null;
@@ -306,8 +408,8 @@ function normalizePlaylistItem(rawItem) {
   const durationSec = Number.isFinite(rawItem.durationSec) ? Number(rawItem.durationSec) : null;
 
   if (type === 'local') {
-    const fullPath = String(rawItem.fullPath || '').trim();
-    if (!fullPath) {
+    const storagePath = toStorageLibraryPath(rawItem.fullPath || rawItem.path || '');
+    if (!storagePath) {
       return null;
     }
     return {
@@ -318,7 +420,7 @@ function normalizePlaylistItem(rawItem) {
       duration,
       durationSec,
       site,
-      fullPath,
+      fullPath: storagePath,
     };
   }
 
@@ -377,6 +479,33 @@ function getPlaylistsFilePath() {
   return path.join(saveDir, 'playlists.json');
 }
 
+function migratePlaylistsToStorageFormat(playlists) {
+  let dirty = false;
+  const migrated = playlists.map((playlist) => {
+    const items = Array.isArray(playlist.items) ? playlist.items : [];
+    const storageItems = items.map(normalizePlaylistItem).filter((item) => !!item);
+    const changed = items.some((item, index) => {
+      const before = String(item?.fullPath || item?.path || '').trim();
+      const after = String(storageItems[index]?.fullPath || '').trim();
+      return before !== after;
+    }) || items.length !== storageItems.length;
+    if (changed) {
+      dirty = true;
+    }
+    return { ...playlist, items: storageItems };
+  });
+  return { playlists: migrated, dirty };
+}
+
+function playlistsForClient(playlists) {
+  return playlists.map((playlist) => ({
+    ...playlist,
+    items: Array.isArray(playlist.items)
+      ? playlist.items.map(expandPlaylistItemForClient).filter((item) => !!item)
+      : [],
+  }));
+}
+
 function getStoredPlaylists() {
   const filePath = getPlaylistsFilePath();
   const legacyRaw = store.get('playlists');
@@ -386,7 +515,7 @@ function getStoredPlaylists() {
     try {
       fs.writeFileSync(filePath, JSON.stringify(normalized, null, 2), 'utf-8');
       store.delete('playlists');
-      return normalized;
+      return playlistsForClient(normalized);
     } catch (e) {
       console.error('Failed to migrate playlists:', e);
     }
@@ -396,7 +525,13 @@ function getStoredPlaylists() {
     if (fs.existsSync(filePath)) {
       const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
       if (Array.isArray(raw)) {
-        return raw.map(normalizePlaylist).filter((playlist) => !!playlist);
+        const normalized = raw.map(normalizePlaylist).filter((playlist) => !!playlist);
+        const { playlists: storagePlaylists, dirty } = migratePlaylistsToStorageFormat(normalized);
+        if (dirty) {
+          fs.writeFileSync(filePath, JSON.stringify(storagePlaylists, null, 2), 'utf-8');
+          console.log('[Library] Migrated playlist paths to library-relative format');
+        }
+        return playlistsForClient(storagePlaylists);
       }
     }
   } catch (err) {
@@ -409,13 +544,14 @@ function setStoredPlaylists(playlists) {
   const normalized = Array.isArray(playlists)
     ? playlists.map(normalizePlaylist).filter((playlist) => !!playlist)
     : [];
+  const { playlists: storagePlaylists } = migratePlaylistsToStorageFormat(normalized);
   try {
     const filePath = getPlaylistsFilePath();
-    fs.writeFileSync(filePath, JSON.stringify(normalized, null, 2), 'utf-8');
+    fs.writeFileSync(filePath, JSON.stringify(storagePlaylists, null, 2), 'utf-8');
   } catch (err) {
     console.error('Failed to write playlists.json:', err);
   }
-  return normalized;
+  return playlistsForClient(storagePlaylists);
 }
 
 function isPathWithin(parent, target) {
@@ -2394,8 +2530,7 @@ ipcMain.handle('clear:cache', async () => {
 
 ipcMain.handle('syncthing:getInfo', async () => {
   try {
-    const info = await syncthingManager.getInfo();
-    return { ok: true, ...info };
+    return await syncthingManager.getInfo();
   } catch (e) {
     return { ok: false, error: e.message };
   }

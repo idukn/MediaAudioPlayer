@@ -112,6 +112,7 @@ let detachSearchMetadataListener = null;
 let detachSearchEnrichmentListener = null;
 let detachSyncUpdatedListener = null;
 let syncInfoRefreshTimer = null;
+let syncInfoFastPollTimer = null;
 let bootCompleted = false;
 let isBackgroundEnriching = false;
 let suppressStatePersist = false;
@@ -120,6 +121,8 @@ let currentPlaylistId = '';
 let pendingPlaylistPickerResolver = null;
 let playlistDragFromIndex = -1;
 let playlistContextMenuIndex = -1;
+let libraryFileIndexByName = null;
+let libraryFileIndexByRel = null;
 const searchTabContentEl = document.querySelector('.tab-content[data-tab="search"]');
 const ALLOWED_SAVE_AUDIO_FORMATS = new Set(['auto', 'mp3', 'm4a', 'wav', 'flac', 'opus']);
 const LOOP_MODES = ['off', 'single', 'playlist'];
@@ -482,6 +485,26 @@ function safeAlert(message) {
   window.alert(message);
 }
 
+/**
+ * YouTube 再生エラー時に、メッセージ + 「YouTube アプリ/ブラウザで開く」を提示する。
+ * 同期 confirm を使い、OK で外部リンクへ。
+ */
+async function alertWithYoutubeFallback(message, webpageUrl) {
+  if (!webpageUrl) {
+    safeAlert(message);
+    return;
+  }
+  const wantsOpen = window.confirm(`${message}\n\n[OK] YouTube アプリ/ブラウザで開く\n[Cancel] 閉じる`);
+  if (!wantsOpen) {
+    return;
+  }
+  try {
+    await window.api.openExternal({ url: webpageUrl });
+  } catch (error) {
+    safeAlert(`外部アプリを開けませんでした。\n${error.message || error}`);
+  }
+}
+
 function setNowPlayingText(text) {
   nowPlayingTextEl.textContent = text && text.trim().length > 0 ? text : '-';
 }
@@ -491,6 +514,88 @@ function buildAudioUrl(fullPath) {
     return window.api.buildLocalAudioUrl(fullPath);
   }
   return `http://127.0.0.1:${audioServerPort}/audio?path=${encodeURIComponent(fullPath)}&t=${Date.now()}`;
+}
+
+function formatPlaybackError(error) {
+  if (!error) {
+    return '不明なエラー';
+  }
+  const raw = error.message || String(error);
+  if (raw.includes('Invidious') || raw.includes('Piped') || raw.includes('公開 API')) {
+    return `${raw}\n\n再インストール後も同じ場合: ネットワーク/VPN、年齢制限付き動画、または F-Droid 版 Termux + RUN_COMMAND 許可を試してください。`;
+  }
+  if (error instanceof DOMException) {
+    const code = audioPlayer?.error?.code;
+    const mediaCodes = {
+      1: 'MEDIA_ERR_ABORTED',
+      2: 'MEDIA_ERR_NETWORK',
+      3: 'MEDIA_ERR_DECODE',
+      4: 'MEDIA_ERR_SRC_NOT_SUPPORTED',
+    };
+    const mediaHint = code ? ` (${mediaCodes[code] || `code=${code}`})` : '';
+    const name = error.name || 'DOMException';
+    const message = error.message || '再生できませんでした';
+    return `${name}: ${message}${mediaHint}`;
+  }
+  return error.message || String(error);
+}
+
+function prepareAudioPlayerForPlayback() {
+  if (audioPlayer?.hasAttribute('crossorigin')) {
+    audioPlayer.removeAttribute('crossorigin');
+  }
+}
+
+function waitForAudioCanPlay(timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    if (audioPlayer.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) {
+      resolve();
+      return;
+    }
+
+    let settled = false;
+    const finish = (fn, arg) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      audioPlayer.removeEventListener('canplay', onCanPlay);
+      audioPlayer.removeEventListener('error', onError);
+      fn(arg);
+    };
+
+    const onCanPlay = () => finish(resolve);
+    const onError = () => {
+      const code = audioPlayer.error?.code;
+      const mediaHints = {
+        1: '読み込み中断',
+        2: 'ネットワークエラー（ファイル未同期・サーバー未起動の可能性）',
+        3: 'デコード失敗（ファイル破損の可能性）',
+        4: '非対応形式または URL が無効（404/403 の可能性）',
+      };
+      const hint = mediaHints[code] || '不明';
+      const src = typeof audioPlayer.src === 'string' ? audioPlayer.src : '';
+      const srcHint = src ? `\nURL: ${src}` : '';
+      finish(reject, new Error(`音声の読み込みに失敗しました (${hint}, mediaError=${code ?? 'unknown'})${srcHint}`));
+    };
+    const timer = setTimeout(
+      () => finish(reject, new Error('音声の読み込みがタイムアウトしました')),
+      timeoutMs,
+    );
+
+    audioPlayer.addEventListener('canplay', onCanPlay, { once: true });
+    audioPlayer.addEventListener('error', onError, { once: true });
+  });
+}
+
+async function playAudioFromUrl(url) {
+  prepareAudioPlayerForPlayback();
+  audioPlayer.pause();
+  audioPlayer.src = url;
+  audioPlayer.load();
+  await waitForAudioCanPlay(30000);
+  await audioPlayer.play();
 }
 
 function cloneSearchItemForState(item) {
@@ -597,17 +702,272 @@ function toPlaylistItemFromSearchItem(item) {
   };
 }
 
+function isAbsoluteLibraryPath(value) {
+  const normalized = String(value || '').replace(/\\/g, '/').trim();
+  return normalized.startsWith('/') || /^[a-zA-Z]:[/\\]/.test(normalized);
+}
+
+/** playlists.json 用: 現在のライブラリ相対パス（Mac/Android 共通）。 */
+function toStorageLibraryPath(fullPath) {
+  const raw = String(fullPath || '').trim();
+  if (!raw) {
+    return '';
+  }
+
+  const libraryRoot = String(baseAudioDir || '').trim().replace(/\\/g, '/');
+  const normalized = raw.replace(/\\/g, '/');
+
+  if (libraryRoot) {
+    if (normalized === libraryRoot) {
+      return '';
+    }
+    if (normalized.startsWith(`${libraryRoot}/`)) {
+      return normalized.slice(libraryRoot.length + 1);
+    }
+  }
+
+  if (!isAbsoluteLibraryPath(normalized)) {
+    return normalized.replace(/^\/+/, '');
+  }
+
+  for (const rel of extractRelativePathCandidates(raw)) {
+    if (rel.includes('/')) {
+      return rel.replace(/^\/+/, '');
+    }
+  }
+
+  return normalized.split('/').pop() || raw;
+}
+
 function toPlaylistItemFromLocalPath(fullPath) {
   const entry = localFiles.find((file) => file.fullPath === fullPath);
+  const storagePath = toStorageLibraryPath(fullPath) || fullPath;
   return {
     type: 'local',
-    title: entry?.name || fullPath.split('/').pop() || '(No title)',
+    title: entry?.name || fullPath.split(/[/\\]/).pop() || '(No title)',
     uploader: 'Local File',
     duration: '-',
     durationSec: null,
     site: 'Local',
-    fullPath,
+    fullPath: storagePath,
   };
+}
+
+function normalizePlaylistItem(raw) {
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+
+  const fullPath = String(raw.fullPath || raw.path || '').trim();
+  const webpageUrl = String(raw.webpageUrl || raw.url || '').trim();
+  const titleFallback = (value) => value.split(/[/\\]/).pop() || '(No title)';
+
+  if (fullPath) {
+    const title = String(raw.title || '').trim() || titleFallback(fullPath);
+    return {
+      id: String(raw.id || `item_local_${Math.random().toString(36).slice(2, 8)}`),
+      type: 'local',
+      title,
+      uploader: String(raw.uploader || 'Local File').trim() || 'Local File',
+      duration: String(raw.duration || '-').trim() || '-',
+      durationSec: Number.isFinite(raw.durationSec) ? Number(raw.durationSec) : null,
+      site: String(raw.site || 'Local').trim() || 'Local',
+      fullPath,
+      webpageUrl: webpageUrl || undefined,
+    };
+  }
+
+  if (webpageUrl) {
+    return {
+      id: String(raw.id || `item_url_${Math.random().toString(36).slice(2, 8)}`),
+      type: 'url',
+      title: String(raw.title || '').trim() || '(No title)',
+      uploader: String(raw.uploader || '-').trim() || '-',
+      duration: String(raw.duration || '-').trim() || '-',
+      durationSec: Number.isFinite(raw.durationSec) ? Number(raw.durationSec) : null,
+      site: String(raw.site || 'unknown').trim() || 'unknown',
+      webpageUrl,
+    };
+  }
+
+  return null;
+}
+
+function invalidateLibraryFileIndex() {
+  libraryFileIndexByName = null;
+  libraryFileIndexByRel = null;
+}
+
+async function ensureLibraryFileIndex() {
+  if (libraryFileIndexByName && libraryFileIndexByRel) {
+    return { byName: libraryFileIndexByName, byRel: libraryFileIndexByRel };
+  }
+
+  const byName = new Map();
+  const byRel = new Map();
+  const libraryRoot = String(baseAudioDir || '').trim();
+  if (!libraryRoot) {
+    libraryFileIndexByName = byName;
+    libraryFileIndexByRel = byRel;
+    return { byName, byRel };
+  }
+
+  const stack = [libraryRoot];
+  while (stack.length > 0) {
+    const dir = stack.pop();
+    let entries = [];
+    try {
+      entries = await window.api.listAudio({ saveDir: dir });
+    } catch (error) {
+      console.warn('[Playlist] listAudio failed:', dir, error);
+      continue;
+    }
+
+    for (const entry of entries) {
+      if (!entry?.fullPath) {
+        continue;
+      }
+      if (entry.isDir) {
+        stack.push(entry.fullPath);
+        continue;
+      }
+      if (!entry.isAudio) {
+        continue;
+      }
+
+      const nameKey = String(entry.name || '').trim().toLowerCase();
+      if (nameKey && !byName.has(nameKey)) {
+        byName.set(nameKey, entry.fullPath);
+      }
+
+      const rel = entry.fullPath
+        .slice(libraryRoot.length)
+        .replace(/^[/\\]+/, '')
+        .toLowerCase();
+      if (rel && !byRel.has(rel)) {
+        byRel.set(rel, entry.fullPath);
+      }
+    }
+  }
+
+  libraryFileIndexByName = byName;
+  libraryFileIndexByRel = byRel;
+  return { byName, byRel };
+}
+
+function extractRelativePathCandidates(fullPath) {
+  const normalized = String(fullPath || '').replace(/\\/g, '/').trim();
+  const lower = normalized.toLowerCase();
+  const candidates = [];
+  const markers = [
+    '/library/',
+    '.media-audio-finder/library/',
+    'media-audio-finder/library/',
+    '/application support/media-audio-finder/library/',
+    '/reference/',
+    '/music/',
+    '/yt_audio_app/',
+  ];
+
+  for (const marker of markers) {
+    const idx = lower.lastIndexOf(marker);
+    if (idx >= 0) {
+      candidates.push(normalized.slice(idx + marker.length));
+    }
+  }
+
+  const isAbsolute = normalized.startsWith('/') || /^[a-zA-Z]:[/\\]/.test(normalized);
+  if (!isAbsolute && normalized) {
+    candidates.push(normalized);
+  }
+
+  const parts = normalized.split('/').filter(Boolean);
+  for (let start = 0; start < parts.length; start += 1) {
+    candidates.push(parts.slice(start).join('/'));
+  }
+
+  const baseName = normalized.split('/').pop();
+  if (baseName) {
+    candidates.push(baseName);
+  }
+
+  return [...new Set(candidates.filter(Boolean))];
+}
+
+async function resolveLocalPlaybackPath(item) {
+  const normalized = normalizePlaylistItem(item);
+  if (!normalized?.fullPath) {
+    return null;
+  }
+
+  const fullPath = normalized.fullPath;
+  const libraryRoot = String(baseAudioDir || '').trim();
+
+  if (!isAbsoluteLibraryPath(fullPath) && libraryRoot) {
+    const relKey = fullPath.replace(/^[/\\]+/, '').toLowerCase();
+    const { byRel } = await ensureLibraryFileIndex();
+    if (relKey && byRel.has(relKey)) {
+      return byRel.get(relKey);
+    }
+    const joined = `${libraryRoot.replace(/\\/g, '/')}/${fullPath.replace(/^[/\\]+/, '')}`;
+    if (isPathWithinLibrary(joined)) {
+      return joined;
+    }
+  }
+
+  if (typeof window.api?.resolveLibraryPath === 'function') {
+    try {
+      const nativeResolved = await window.api.resolveLibraryPath({ path: fullPath });
+      if (nativeResolved?.found && nativeResolved.path) {
+        return nativeResolved.path;
+      }
+    } catch (error) {
+      console.warn('[Playlist] native resolveLibraryPath failed:', error);
+    }
+  }
+
+  if (isPathWithinLibrary(fullPath) && libraryRoot) {
+    const { byRel } = await ensureLibraryFileIndex();
+    const relKey = fullPath
+      .slice(libraryRoot.length)
+      .replace(/^[/\\]+/, '')
+      .toLowerCase();
+    if (relKey && byRel.has(relKey)) {
+      return byRel.get(relKey);
+    }
+  }
+
+  if (!libraryRoot) {
+    return null;
+  }
+
+  const { byName, byRel } = await ensureLibraryFileIndex();
+  for (const rel of extractRelativePathCandidates(fullPath)) {
+    const relKey = rel.replace(/^[/\\]+/, '').toLowerCase();
+    if (byRel.has(relKey)) {
+      return byRel.get(relKey);
+    }
+
+    const joined = `${libraryRoot}/${rel.replace(/^[/\\]+/, '')}`;
+    if (isPathWithinLibrary(joined) && byRel.has(relKey)) {
+      return byRel.get(relKey);
+    }
+  }
+
+  const baseKey = fullPath.split(/[/\\]/).pop()?.toLowerCase();
+  if (baseKey && byName.has(baseKey)) {
+    return byName.get(baseKey);
+  }
+
+  return null;
+}
+
+async function ensureAudioServerReady() {
+  const port = await window.api.getAudioServerPort();
+  if (!port) {
+    throw new Error('オーディオサーバーを起動できませんでした');
+  }
+  audioServerPort = port;
 }
 
 function getPlaybackQueueItemKey(item) {
@@ -647,40 +1007,62 @@ function buildLocalPlaybackQueue() {
 }
 
 async function playPlaybackQueueItem(item, { statusPrefix = '▶️ 再生中' } = {}) {
-  if (!item) {
+  const normalized = normalizePlaylistItem(item);
+  if (!normalized) {
     throw new Error('再生対象が見つかりませんでした。');
   }
 
   previewLoadingIndex = -1;
-  currentAudioDurationSec = Number.isFinite(item.durationSec)
-    ? Number(item.durationSec)
-    : parseDurationInputToSec(item.duration, 0);
+  currentAudioDurationSec = Number.isFinite(normalized.durationSec)
+    ? Number(normalized.durationSec)
+    : parseDurationInputToSec(normalized.duration, 0);
   playerProgressBar.style.width = '0%';
   playerProgressBarBuffered.style.width = '0%';
   playerTime.textContent = `0:00 / ${formatSecToDurationInput(currentAudioDurationSec)}`;
 
-  if (item.type === 'local' && item.fullPath) {
-    const localIndex = localFiles.findIndex((file) => file?.fullPath === item.fullPath);
+  const resolvedPath = await resolveLocalPlaybackPath(normalized);
+  if (resolvedPath) {
+    const localIndex = localFiles.findIndex((file) => file?.fullPath === resolvedPath);
     selectedLocalIndex = localIndex;
     if (localIndex >= 0) {
       renderLocalFiles();
     }
 
-    audioPlayer.src = buildAudioUrl(item.fullPath);
-    await audioPlayer.play();
-    setNowPlayingText(item.title || 'Local Audio');
-    setStatus(`${statusPrefix}: ${item.title || 'Local Audio'}`);
+    console.log('[Audio] Local playback:', {
+      title: normalized.title,
+      resolvedPath,
+      originalPath: normalized.fullPath,
+    });
+    await ensureAudioServerReady();
+    await playAudioFromUrl(buildAudioUrl(resolvedPath));
+    setNowPlayingText(normalized.title || 'Local Audio');
+    setStatus(`${statusPrefix}: ${normalized.title || 'Local Audio'}`);
     return;
   }
 
   selectedLocalIndex = -1;
-  if (item.webpageUrl) {
-    const previewUrl = `http://127.0.0.1:${audioServerPort}/stream?url=${encodeURIComponent(item.webpageUrl)}`;
-    audioPlayer.src = previewUrl;
-    await audioPlayer.play();
-    setNowPlayingText(item.title || 'Preview');
-    setStatus(`${statusPrefix}: ${item.title || 'Preview'}`);
+  if (normalized.webpageUrl) {
+    await ensureAudioServerReady();
+    setStatus('⏳ YouTube 音声を準備中（初回は数十秒〜数分）…');
+    let previewUrl;
+    if (typeof window.api.preparePreviewStream === 'function') {
+      previewUrl = await window.api.preparePreviewStream({ url: normalized.webpageUrl });
+    } else if (typeof window.api.getPreviewStreamUrl === 'function') {
+      previewUrl = await window.api.getPreviewStreamUrl({ url: normalized.webpageUrl });
+    } else {
+      previewUrl = `http://127.0.0.1:${audioServerPort}/stream?url=${encodeURIComponent(normalized.webpageUrl)}`;
+    }
+    await playAudioFromUrl(previewUrl);
+    setNowPlayingText(normalized.title || 'Preview');
+    setStatus(`${statusPrefix}: ${normalized.title || 'Preview'}`);
     return;
+  }
+
+  if (normalized.type === 'local' || normalized.fullPath) {
+    throw new Error(
+      `ファイルが見つかりません: ${normalized.title || normalized.fullPath}\n`
+        + `保存パス: ${normalized.fullPath || '(なし)'}`,
+    );
   }
 
   throw new Error('再生元URLが見つかりませんでした。');
@@ -810,7 +1192,7 @@ function renderPlaylists() {
 
     const sub = document.createElement('div');
     sub.className = 'playlist-item-sub';
-    const sourceLabel = item.type === 'local' ? 'Local File' : item.site || 'URL';
+    const sourceLabel = item.type === 'local' || item.fullPath ? 'Local File' : item.site || 'URL';
     const durationLabel = item.duration || '-';
     sub.textContent = `${sourceLabel} / ${item.uploader || '-'} / ${durationLabel}`;
 
@@ -836,7 +1218,14 @@ function renderPlaylists() {
 
 async function loadPlaylists({ keepCurrentSelection = true } = {}) {
   const loaded = await window.api.getPlaylists();
-  playlists = Array.isArray(loaded) ? loaded : [];
+  playlists = Array.isArray(loaded)
+    ? loaded.map((playlist) => ({
+        ...playlist,
+        items: Array.isArray(playlist?.items)
+          ? playlist.items.map(normalizePlaylistItem).filter(Boolean)
+          : [],
+      }))
+    : [];
 
   if (!keepCurrentSelection || !playlists.some((playlist) => playlist.id === currentPlaylistId)) {
     currentPlaylistId = playlists[0]?.id || '';
@@ -1039,7 +1428,9 @@ function openPlaylistPickerModal(title = '追加先プレイリストを選択')
 }
 
 async function addItemsToPlaylistFlow(items) {
-  const normalizedItems = Array.isArray(items) ? items.filter((item) => !!item) : [];
+  const normalizedItems = Array.isArray(items)
+    ? items.map(normalizePlaylistItem).filter(Boolean)
+    : [];
   if (normalizedItems.length === 0) {
     safeAlert('プレイリストに追加する曲を選択してください。');
     return;
@@ -1065,9 +1456,18 @@ async function addItemsToPlaylistFlow(items) {
 }
 
 async function playPlaylistItem(itemIndex) {
+  try {
+    await ensureAudioServerReady();
+    await ensureLibraryFileIndex();
+  } catch (error) {
+    safeAlert(`再生の準備に失敗しました。\n${error.message}`);
+    setStatus('再生の準備に失敗しました');
+    return;
+  }
+
   const selectedPlaylist = playlists.find((playlist) => playlist.id === currentPlaylistId);
   const queue = Array.isArray(selectedPlaylist?.items)
-    ? selectedPlaylist.items.filter((item) => !!item)
+    ? selectedPlaylist.items.map(normalizePlaylistItem).filter(Boolean)
     : [];
   if (queue.length === 0) {
     return;
@@ -1081,8 +1481,15 @@ async function playPlaylistItem(itemIndex) {
   try {
     await playCurrentPlaybackQueueItem({ statusPrefix: '▶️ 再生中' });
   } catch (error) {
-    safeAlert(`再生に失敗しました。\n${error.message}`);
+    const message = formatPlaybackError(error);
+    const currentItem = queue[safeIndex];
+    console.error('[Playlist] play failed:', message, error, currentItem);
     setStatus('再生に失敗しました');
+    if (currentItem?.type === 'url' && currentItem.webpageUrl) {
+      await alertWithYoutubeFallback(`再生に失敗しました。\n${message}`, currentItem.webpageUrl);
+    } else {
+      safeAlert(`再生に失敗しました。\n${message}`);
+    }
   }
 }
 
@@ -1526,8 +1933,8 @@ function renderResults() {
         setNowPlayingText(result.title || 'Preview');
         setStatus(`▶️ 試聴中: ${result.title}`);
       } catch (error) {
-        safeAlert(`試聴に失敗しました。\n${error.message}`);
         setStatus('試聴に失敗しました');
+        await alertWithYoutubeFallback(`試聴に失敗しました。\n${error.message}`, result.webpageUrl);
       } finally {
         previewLoadingIndex = -1;
         renderResults();
@@ -1752,18 +2159,71 @@ function renderSyncDeviceList(devices) {
   }
 }
 
+function stopSyncInfoFastPoll() {
+  if (syncInfoFastPollTimer) {
+    clearInterval(syncInfoFastPollTimer);
+    syncInfoFastPollTimer = null;
+  }
+}
+
+function scheduleSyncInfoFastPoll() {
+  stopSyncInfoFastPoll();
+  syncInfoFastPollTimer = setInterval(() => {
+    if (syncMyDeviceIdEl?.value?.trim()) {
+      stopSyncInfoFastPoll();
+      return;
+    }
+    refreshSyncInfo().catch(() => {});
+  }, 2000);
+  setTimeout(() => {
+    stopSyncInfoFastPoll();
+  }, 120000);
+}
+
+async function refreshSyncInfoUntilMyId(maxWaitMs = 60000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < maxWaitMs) {
+    await refreshSyncInfo();
+    if (syncMyDeviceIdEl?.value?.trim()) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+  return Boolean(syncMyDeviceIdEl?.value?.trim());
+}
+
 function applySyncInfo(info) {
+  const deviceId = String(info?.myID || info?.deviceID || '').trim();
+
   if (!info?.ok) {
     if (syncFolderStatusEl) {
-      syncFolderStatusEl.textContent = `同期: ${info?.error || '状態を取得できません'}`;
+      let errText = info?.error || '状態を取得できません';
+      if (/localhost|127\.0\.0\.1|接続できません|API/i.test(errText)) {
+        errText += '（端末内 Syncthing の起動を待つか、アプリを再起動してください）';
+      }
+      syncFolderStatusEl.textContent = `同期: ${errText}`;
+    }
+    if (deviceId && syncMyDeviceIdEl) {
+      syncMyDeviceIdEl.value = deviceId;
     }
     renderSyncDeviceList([]);
+    if (!syncMyDeviceIdEl?.value?.trim()) {
+      scheduleSyncInfoFastPoll();
+    }
     return;
   }
   if (syncMyDeviceIdEl) {
-    syncMyDeviceIdEl.value = info.myID || '';
+    syncMyDeviceIdEl.value = deviceId;
   }
-  if (syncFolderStatusEl) {
+  if (!syncMyDeviceIdEl?.value?.trim()) {
+    if (syncFolderStatusEl) {
+      syncFolderStatusEl.textContent = 'Syncthing 起動中...（デバイス ID を取得しています）';
+    }
+    scheduleSyncInfoFastPoll();
+  } else {
+    stopSyncInfoFastPoll();
+  }
+  if (syncFolderStatusEl && syncMyDeviceIdEl?.value?.trim()) {
     const stateLabel = formatSyncFolderState(info.folderState);
     const pathLabel = info.folderPath ? ` (${info.folderPath})` : '';
     const pending = Number(info.needBytes) > 0
@@ -1789,6 +2249,10 @@ async function handleSyncUpdated(payload = {}) {
     return;
   }
 
+  if (payload?.myID && syncMyDeviceIdEl) {
+    syncMyDeviceIdEl.value = String(payload.myID);
+  }
+
   if (payload.phase === 'syncing' && payload.startup) {
     if (syncFolderStatusEl) {
       syncFolderStatusEl.textContent = 'バックグラウンド同期中...';
@@ -1799,6 +2263,7 @@ async function handleSyncUpdated(payload = {}) {
 
   const type = payload?.type;
   if (!type || type === 'playlists' || type === 'dir') {
+    invalidateLibraryFileIndex();
     await loadPlaylists({ keepCurrentSelection: true });
   }
   if (!type || type === 'audio' || type === 'dir') {
@@ -1828,6 +2293,7 @@ function getActiveListDir() {
 
 async function refreshLocal() {
   try {
+    invalidateLibraryFileIndex();
     const listDir = getActiveListDir();
     if (!listDir) {
       return;
@@ -1961,6 +2427,8 @@ async function boot() {
   }, 15000);
   void refreshSyncInfo();
 
+  prepareAudioPlayerForPlayback();
+
   // Add audio player error handling
   audioPlayer.addEventListener('error', () => {
     const errorCode = audioPlayer.error?.code;
@@ -1979,19 +2447,36 @@ async function boot() {
       readyState: audioPlayer.readyState,
     });
 
-    const isPreviewStream = typeof audioPlayer.src === 'string' && audioPlayer.src.includes('/stream?url=');
-    if (isPreviewStream) {
+    const src = String(audioPlayer.src || '');
+    const isYoutubeStream = src.includes('/stream?url=') || src.includes('/stream/prepare');
+    const isLocalStream = src.includes('/audio?path=') || src.includes('_capacitor_file_');
+    const currentQueueItem = getCurrentPlaybackQueueItem();
+
+    if (isYoutubeStream || currentQueueItem?.type === 'url') {
       setStatus(`❌ 試聴エラー: ${errorMessage}`);
-      window.api.getStreamLogPath()
-        .then((logPath) => {
-          safeAlert(`試聴に失敗しました。\n\n理由: ${errorMessage}\n\nログを確認してください:\n${logPath}`);
-        })
-        .catch(() => {
-          safeAlert(`試聴に失敗しました。\n\n理由: ${errorMessage}`);
-        });
+      const youtubeUrl = currentQueueItem?.webpageUrl || '';
+      alertWithYoutubeFallback(
+        `試聴に失敗しました。\n\n理由: ${errorMessage}\n\n`
+          + '2026 年 5 月時点、公開 Piped/Invidious が YouTube ボット検出で停止しています。\n'
+          + '・YouTube アプリ/ブラウザで開いて再生してください。\n'
+          + '・F-Droid 版 Termux + yt-dlp + RUN_COMMAND 許可があれば一部再生可能です。',
+        youtubeUrl,
+      );
       return;
     }
-    
+
+    if (isLocalStream) {
+      setStatus(`❌ 再生エラー: ${errorMessage}`);
+      const file = localFiles[selectedLocalIndex] || currentQueueItem;
+      const name = file?.name || file?.title || currentQueueItem?.fullPath || '(不明)';
+      safeAlert(
+        `ローカルファイルの再生に失敗しました。\n\n理由: ${errorMessage}\n対象: ${name}\nURL: ${src}\n\n`
+          + '・ファイル名に絵文字・特殊記号があると一部端末で失敗します。\n'
+          + '・ファイル名をリネームしてから試してください。'
+      );
+      return;
+    }
+
     const file = localFiles[selectedLocalIndex];
     if (file) {
       setStatus(`❌ 再生エラー: ${file.name} - ${errorMessage}`);
@@ -2554,10 +3039,20 @@ if (saveAudioFormatEl) {
 
 if (syncCopyDeviceIdBtn && syncMyDeviceIdEl) {
   syncCopyDeviceIdBtn.addEventListener('click', async () => {
-    const deviceId = syncMyDeviceIdEl.value.trim();
+    let deviceId = syncMyDeviceIdEl.value.trim();
     if (!deviceId) {
-      safeAlert('デバイス ID を取得できていません。しばらく待ってから再試行してください。');
-      return;
+      if (syncConnectStatusEl) {
+        syncConnectStatusEl.textContent = 'デバイス ID を取得中...';
+      }
+      const ready = await refreshSyncInfoUntilMyId(60000);
+      deviceId = syncMyDeviceIdEl.value.trim();
+      if (!ready || !deviceId) {
+        safeAlert('デバイス ID を取得できていません。同期パネルで「起動中」が消えるまで待ってから再試行してください。');
+        if (syncConnectStatusEl) {
+          syncConnectStatusEl.textContent = '';
+        }
+        return;
+      }
     }
     try {
       await window.api.writeClipboardText({ text: deviceId });

@@ -8,15 +8,171 @@ ANDROID_DIR="$MOBILE_DIR/android"
 APK_PATH="$ANDROID_DIR/app/build/outputs/apk/debug/app-debug.apk"
 APP_ID="local.media.audio.finder"
 
-# Default Android SDK location (macOS). Override with ANDROID_HOME if needed.
-if [[ -z "${ANDROID_HOME:-}" && -d "$HOME/Library/Android/sdk" ]]; then
-  export ANDROID_HOME="$HOME/Library/Android/sdk"
+java_meets_capacitor_requirement() {
+  local home="$1"
+  [[ -x "$home/bin/java" ]] || return 1
+  local major
+  major="$("$home/bin/java" -version 2>&1 | head -1 | sed -E 's/.*"([0-9]+).*/\1/')"
+  [[ "${major:-0}" -ge 21 ]]
+}
+
+find_java_home() {
+  local candidate
+
+  if [[ -n "${JAVA_HOME:-}" ]] && java_meets_capacitor_requirement "$JAVA_HOME"; then
+    echo "$JAVA_HOME"
+    return 0
+  fi
+
+  for candidate in \
+    "/Applications/Android Studio.app/Contents/jbr/Contents/Home" \
+    "$HOME/Applications/Android Studio.app/Contents/jbr/Contents/Home"; do
+    if java_meets_capacitor_requirement "$candidate"; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+
+  if command -v brew >/dev/null 2>&1; then
+    for formula in openjdk@21 openjdk; do
+      candidate="$(brew --prefix "$formula" 2>/dev/null || true)"
+      if [[ -n "$candidate" ]]; then
+        if java_meets_capacitor_requirement "$candidate"; then
+          echo "$candidate"
+          return 0
+        fi
+        if [[ -x "$candidate/libexec/openjdk.jdk/Contents/Home/bin/java" ]] \
+          && java_meets_capacitor_requirement "$candidate/libexec/openjdk.jdk/Contents/Home"; then
+          echo "$candidate/libexec/openjdk.jdk/Contents/Home"
+          return 0
+        fi
+      fi
+    done
+  fi
+
+  if [[ -x /usr/libexec/java_home ]]; then
+    candidate="$(/usr/libexec/java_home -v 21 2>/dev/null || true)"
+    if [[ -n "$candidate" ]] && java_meets_capacitor_requirement "$candidate"; then
+      echo "$candidate"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+JAVA_HOME_DETECTED="$(find_java_home || true)"
+if [[ -z "$JAVA_HOME_DETECTED" ]]; then
+  echo "Java 21+ is required (Capacitor 7 / @capacitor/filesystem)."
+  echo ""
+  echo "Install JDK 21, then re-run:"
+  echo "  brew install openjdk@21"
+  echo "  export JAVA_HOME=\"\$(brew --prefix openjdk@21)/libexec/openjdk.jdk/Contents/Home\""
+  exit 1
 fi
-if [[ -n "${ANDROID_HOME:-}" ]]; then
-  export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+export JAVA_HOME="$JAVA_HOME_DETECTED"
+export PATH="$JAVA_HOME/bin:$PATH"
+echo "Using JAVA_HOME=$JAVA_HOME"
+
+find_android_sdk() {
+  local candidate brew_prefix
+  for candidate in \
+    "${ANDROID_HOME:-}" \
+    "${ANDROID_SDK_ROOT:-}" \
+    "$HOME/Library/Android/sdk"; do
+    if [[ -n "$candidate" && -d "$candidate/platform-tools" ]]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  if command -v brew >/dev/null 2>&1; then
+    brew_prefix="$(brew --prefix 2>/dev/null || true)"
+    candidate="$brew_prefix/share/android-commandlinetools"
+    if [[ -d "$candidate/platform-tools" ]]; then
+      echo "$candidate"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+write_local_properties() {
+  local sdk_dir="$1"
+  local props="$ANDROID_DIR/local.properties"
+  sdk_dir="${sdk_dir//\\/\\\\}"
+  printf 'sdk.dir=%s\n' "$sdk_dir" >"$props"
+  echo "Wrote $props (sdk.dir=$sdk_dir)"
+}
+
+ANDROID_SDK="$(find_android_sdk || true)"
+if [[ -z "$ANDROID_SDK" ]]; then
+  SETUP_SDK_SCRIPT="$SCRIPT_DIR/scripts/setup-android-sdk.sh"
+  if [[ -x "$SETUP_SDK_SCRIPT" ]]; then
+    echo "Android SDK not found. Running scripts/setup-android-sdk.sh ..."
+    "$SETUP_SDK_SCRIPT"
+    ANDROID_SDK="$(find_android_sdk || true)"
+  fi
+fi
+if [[ -z "$ANDROID_SDK" ]]; then
+  echo "Android SDK not found."
+  echo ""
+  echo "Option A (CLI, no Android Studio):"
+  echo "  ./scripts/setup-android-sdk.sh"
+  echo "  ./build_and_install_android_app.sh"
+  echo ""
+  echo "Option B (Android Studio):"
+  echo "  Install Android Studio > SDK Manager"
+  echo "  export ANDROID_HOME=\"\$HOME/Library/Android/sdk\""
+  exit 1
+fi
+export ANDROID_HOME="$ANDROID_SDK"
+export ANDROID_SDK_ROOT="$ANDROID_SDK"
+export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+
+SYNCTHING_SO="$MOBILE_DIR/plugins/media-audio-finder/android/src/main/jniLibs/arm64-v8a/libsyncthing.so"
+FFMPEG_SO="$MOBILE_DIR/plugins/media-audio-finder/android/src/main/jniLibs/arm64-v8a/libffmpeg.so"
+FFMPEG_DEP="$MOBILE_DIR/plugins/media-audio-finder/android/src/main/jniLibs/arm64-v8a/libytdavdevice62.so"
+APP_JNI_DIR="$ANDROID_DIR/app/src/main/jniLibs/arm64-v8a"
+APP_SYNCTHING_SO="$APP_JNI_DIR/libsyncthing.so"
+APP_FFMPEG_SO="$APP_JNI_DIR/libffmpeg.so"
+
+if [[ ! -f "$SYNCTHING_SO" ]]; then
+  echo "Fetching Android Syncthing binary (first time)..."
+  "$SCRIPT_DIR/scripts/build-syncthing-android.sh"
 fi
 
-cd "$MOBILE_DIR"
+if [[ ! -f "$FFMPEG_SO" || ! -f "$FFMPEG_DEP" ]]; then
+  echo "Fetching Android ffmpeg bundle (first time)..."
+  "$SCRIPT_DIR/scripts/build-media-tools-android.sh"
+fi
+
+if [[ ! -f "$SYNCTHING_SO" ]]; then
+  echo "Error: Syncthing binary missing at $SYNCTHING_SO"
+  echo "Run: ./scripts/build-syncthing-android.sh"
+  exit 1
+fi
+
+if [[ ! -f "$FFMPEG_SO" || ! -f "$FFMPEG_DEP" ]]; then
+  echo "Error: ffmpeg jni bundle missing (libffmpeg.so / libytdavdevice62.so)"
+  echo "Run: ./scripts/build-media-tools-android.sh"
+  exit 1
+fi
+
+bundle_native_libs() {
+  local plugin_jni="$MOBILE_DIR/plugins/media-audio-finder/android/src/main/jniLibs/arm64-v8a"
+  mkdir -p "$APP_JNI_DIR"
+  cp "$SYNCTHING_SO" "$APP_SYNCTHING_SO"
+  chmod +x "$APP_SYNCTHING_SO"
+  shopt -s nullglob
+  for lib in "$plugin_jni"/*.so; do
+    base="$(basename "$lib")"
+    [[ "$base" == "libsyncthing.so" ]] && continue
+    cp -f "$lib" "$APP_JNI_DIR/$base"
+  done
+  shopt -u nullglob
+  chmod +x "$APP_FFMPEG_SO" 2>/dev/null || true
+  echo "Bundled native libs into $APP_JNI_DIR"
+}
 
 if ! command -v node >/dev/null 2>&1; then
   echo "node is required. Install Node.js 20+ first."
@@ -27,6 +183,8 @@ if ! command -v adb >/dev/null 2>&1; then
   echo "adb is required. Install Android SDK platform-tools (Android Studio)."
   exit 1
 fi
+
+cd "$MOBILE_DIR"
 
 echo "[1/4] npm install"
 npm install
@@ -41,17 +199,35 @@ fi
 echo "[3/4] Sync web assets and Capacitor"
 npm run cap:sync
 
+bundle_native_libs
+
 if [[ ! -x "$ANDROID_DIR/gradlew" ]]; then
   echo "gradlew not found under $ANDROID_DIR"
   echo "Try: cd mobile && npx cap add android"
   exit 1
 fi
 
+write_local_properties "$ANDROID_HOME"
+
 echo "[4/4] Gradle assembleDebug"
 (cd "$ANDROID_DIR" && ./gradlew assembleDebug)
 
 if [[ ! -f "$APK_PATH" ]]; then
   echo "Build failed: APK not found at $APK_PATH"
+  exit 1
+fi
+
+apk_contains_native_libs() {
+  local apk="$1"
+  unzip -l "$apk" 2>/dev/null | grep -F 'lib/arm64-v8a/libsyncthing.so' >/dev/null \
+    && unzip -l "$apk" 2>/dev/null | grep -F 'lib/arm64-v8a/libffmpeg.so' >/dev/null \
+    && unzip -l "$apk" 2>/dev/null | grep -F 'lib/arm64-v8a/libytdavdevice62.so' >/dev/null \
+    && unzip -l "$apk" 2>/dev/null | grep -F 'lib/arm64-v8a/libytdzlib1.so' >/dev/null
+}
+
+if ! apk_contains_native_libs "$APK_PATH"; then
+  echo "Build failed: APK is missing libsyncthing.so or libffmpeg.so."
+  echo "Re-run: ./scripts/build-syncthing-android.sh && ./scripts/build-media-tools-android.sh && ./build_and_install_android_app.sh"
   exit 1
 fi
 

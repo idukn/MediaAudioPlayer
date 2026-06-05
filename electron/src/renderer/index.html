@@ -157,6 +157,7 @@
         <div class="sync-panel">
           <div class="sync-panel-title">P2P 同期 (Syncthing)</div>
           <p class="sync-panel-desc">ライブラリ内の音源とプレイリストを、他のPCと自動同期します。両方の端末でお互いのデバイス ID を登録してください。</p>
+          <p class="sync-panel-desc" style="opacity:0.85;font-size:0.9em;">※ Mac のブラウザで <code>localhost:8384</code> を開いても Android 端末の Syncthing には届きません。設定はこの画面から行ってください。</p>
           <div class="row sync-device-row">
             <label for="syncMyDeviceId">この端末の ID</label>
             <input id="syncMyDeviceId" type="text" readonly />
@@ -197,7 +198,7 @@
             <span id="playerVolumeValue" class="player-volume-value">100%</span>
           </div>
         </div>
-        <audio id="audioPlayer" crossorigin="anonymous" style="display: none;"></audio>
+        <audio id="audioPlayer" style="display: none;"></audio>
       </section>
 
     </div>

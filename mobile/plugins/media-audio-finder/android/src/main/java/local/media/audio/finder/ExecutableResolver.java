@@ -13,7 +13,7 @@ final class ExecutableResolver {
 
     static String resolve(Context context, String name) {
         List<String> candidates = new ArrayList<>();
-        candidates.add("/data/data/com.termux/files/usr/bin/" + name);
+        candidates.add(MediaTools.TERMUX_BIN + "/" + name);
         File filesDir = context.getFilesDir();
         if (filesDir != null) {
             candidates.add(new File(filesDir, "bin/" + name).getAbsolutePath());

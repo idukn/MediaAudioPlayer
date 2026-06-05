@@ -8,22 +8,34 @@ const { app } = require('electron');
 
 const VERSION = 'v1.27.6';
 const FOLDER_ID = 'yt-audio-app-sync';
-const DEVICE_ID_RE = /^[A-Z0-9]{7}(-[A-Z0-9]{7}){6}$/;
+const DEVICE_ID_CHARS = /^[A-Z2-7]+$/;
+const DEVICE_ID_GROUPED_RE = /^[A-Z2-7]{7}(?:-[A-Z2-7]{7}){6,7}$/;
+
+function sanitizeDeviceIDInput(raw) {
+  return String(raw || '')
+    .trim()
+    .replace(/[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]/g, '-')
+    .replace(/\s+/g, '')
+    .toUpperCase();
+}
 
 function normalizeDeviceID(raw) {
-  const trimmed = String(raw || '').trim().toUpperCase();
+  const trimmed = sanitizeDeviceIDInput(raw);
   if (!trimmed) {
     return null;
   }
-  if (DEVICE_ID_RE.test(trimmed)) {
+  if (DEVICE_ID_GROUPED_RE.test(trimmed)) {
     return trimmed;
   }
   const compact = trimmed.replace(/-/g, '');
-  if (compact.length !== 49 || !/^[A-Z2-7]+$/.test(compact)) {
+  if (!DEVICE_ID_CHARS.test(compact)) {
+    return null;
+  }
+  if (compact.length !== 52 && compact.length !== 56) {
     return null;
   }
   const parts = compact.match(/.{1,7}/g);
-  return parts.join('-');
+  return parts ? parts.join('-') : null;
 }
 
 function getReleaseDetails() {
@@ -113,6 +125,13 @@ async function downloadSyncthing(binDir) {
   if (osName !== 'windows') {
     fs.chmodSync(finalBinary, 0o755);
   }
+  if (osName === 'darwin' || osName === 'macos') {
+    try {
+      execSync(`xattr -cr "${finalBinary}"`);
+    } catch (_) {
+      /* quarantine removal is best-effort */
+    }
+  }
 
   // Cleanup
   fs.rmSync(extractedFolder, { recursive: true, force: true });
@@ -131,6 +150,8 @@ class SyncthingManager {
     this.baseUrl = '';
     this._shouldRun = false;
     this._starting = false;
+    this._readyPromise = null;
+    this._lastStartError = '';
   }
 
   get binaryPath() {
@@ -145,7 +166,33 @@ class SyncthingManager {
     return this.binaryPath;
   }
 
+  async attachToExistingDaemon() {
+    if (!fs.existsSync(this.configDir)) {
+      return false;
+    }
+    if (!this.readConfig()) {
+      return false;
+    }
+    try {
+      await this.getStatus();
+      console.log('[Syncthing] Attached to already running daemon at', this.baseUrl);
+      return true;
+    } catch (err) {
+      console.warn('[Syncthing] Existing daemon not reachable:', err.message);
+      return false;
+    }
+  }
+
   async start() {
+    if (this.process || this._starting) {
+      if (this.apiKey) {
+        return;
+      }
+    } else if (await this.attachToExistingDaemon()) {
+      this._shouldRun = true;
+      return;
+    }
+
     if (this.process || this._starting) return;
     this._shouldRun = true;
     this._starting = true;
@@ -156,19 +203,35 @@ class SyncthingManager {
         fs.mkdirSync(this.configDir, { recursive: true });
       }
 
+      if (await this.attachToExistingDaemon()) {
+        return;
+      }
+
       console.log('[Syncthing] Starting daemon...');
+      this._lastStartError = '';
       this.process = spawn(bin, [
         '--no-browser',
         '--no-restart',
         `--home=${this.configDir}`,
       ], {
-        stdio: 'ignore',
+        stdio: ['ignore', 'ignore', 'pipe'],
         windowsHide: true,
       });
+
+      if (this.process.stderr) {
+        this.process.stderr.on('data', (chunk) => {
+          const msg = chunk.toString().trim();
+          if (msg) {
+            this._lastStartError = msg;
+            console.error('[Syncthing] stderr:', msg);
+          }
+        });
+      }
 
       this.process.on('close', (code) => {
         console.log(`[Syncthing] Daemon exited with code ${code}`);
         this.process = null;
+        this._readyPromise = null;
         if (this._shouldRun) {
           setTimeout(() => {
             this.start().catch((err) => {
@@ -200,29 +263,36 @@ class SyncthingManager {
     throw new Error('Syncthing API did not become ready in time');
   }
 
-  async readConfig() {
+  readConfig() {
     const configPath = path.join(this.configDir, 'config.xml');
     if (!fs.existsSync(configPath)) {
-      console.error('[Syncthing] config.xml not found yet.');
-      return;
+      return false;
     }
 
     const xml = fs.readFileSync(configPath, 'utf-8');
-    const apiKeyMatch = xml.match(/<apikey>([^<]+)<\/apikey>/);
-    const addressMatch = xml.match(/<address>([^<]+)<\/address>/); // Usually 127.0.0.1:8384
+    const guiBlock = xml.match(/<gui[\s\S]*?<\/gui>/i);
+    const source = guiBlock ? guiBlock[0] : xml;
+    const apiKeyMatch = source.match(/<apikey>([^<]+)<\/apikey>/i);
+    const addressMatch = source.match(/<address>([^<]+)<\/address>/i);
 
     if (apiKeyMatch) {
-      this.apiKey = apiKeyMatch[1];
-    }
-    
-    if (addressMatch) {
-      const addr = addressMatch[1];
-      this.baseUrl = `http://${addr.replace('127.0.0.1', 'localhost')}`;
-    } else {
-      this.baseUrl = 'http://localhost:8384';
+      this.apiKey = apiKeyMatch[1].trim();
     }
 
-    console.log(`[Syncthing] API Ready at ${this.baseUrl}`);
+    const defaultBaseUrl = 'http://127.0.0.1:8384';
+    if (addressMatch) {
+      const addr = addressMatch[1].trim();
+      if (addr && addr !== 'dynamic' && addr.includes(':')) {
+        const port = addr.includes(':') ? addr.substring(addr.lastIndexOf(':') + 1) : '8384';
+        this.baseUrl = `http://127.0.0.1:${port}`;
+      } else {
+        this.baseUrl = defaultBaseUrl;
+      }
+    } else {
+      this.baseUrl = defaultBaseUrl;
+    }
+
+    return Boolean(this.apiKey);
   }
 
   async apiRequest(method, endpoint, data = null) {
@@ -307,45 +377,78 @@ class SyncthingManager {
   }
 
   async bootstrap(saveDir) {
-    await this.start();
+    await this.ensureReady();
     await this.ensureFolder(saveDir);
     await this.waitForApi();
     return this.runStartupSync();
   }
 
+  async ensureReady(maxAttempts = 120) {
+    if (!this._readyPromise) {
+      this._readyPromise = (async () => {
+        await this.start();
+        await this.waitForApi(maxAttempts);
+      })().catch((err) => {
+        this._readyPromise = null;
+        throw err;
+      });
+    }
+    return this._readyPromise;
+  }
+
   async getInfo() {
-    const status = await this.getStatus();
-    const config = await this.getConfig();
-    const connections = await this.getConnections();
-    let folderStatus = null;
     try {
-      folderStatus = await this.getFolderStatus();
-    } catch (_) {
-      /* folder may not exist yet */
+      await this.ensureReady();
+    } catch (err) {
+      const detail = this._lastStartError ? `: ${this._lastStartError}` : '';
+      return {
+        ok: false,
+        error: `${err.message}${detail}`,
+        starting: Boolean(this._starting || !this.apiKey),
+      };
     }
 
-    const myID = status.myID;
-    const folder = config.folders.find((f) => f.id === FOLDER_ID);
-    const remoteDevices = config.devices
-      .filter((device) => device.deviceID !== myID)
-      .map((device) => {
-        const conn = connections.connections?.[device.deviceID];
-        return {
-          deviceID: device.deviceID,
-          name: device.name || device.deviceID.substring(0, 7),
-          connected: Boolean(conn?.connected),
-        };
-      });
+    try {
+      const status = await this.getStatus();
+      const config = await this.getConfig();
+      const connections = await this.getConnections();
+      let folderStatus = null;
+      try {
+        folderStatus = await this.getFolderStatus();
+      } catch (_) {
+        /* folder may not exist yet */
+      }
 
-    return {
-      myID,
-      folderId: FOLDER_ID,
-      folderPath: folder?.path || '',
-      folderState: folderStatus?.state || (folder ? 'idle' : 'missing'),
-      globalBytes: folderStatus?.globalBytes ?? 0,
-      needBytes: folderStatus?.needBytes ?? 0,
-      devices: remoteDevices,
-    };
+      const myID = normalizeDeviceID(status.myID) || status.myID;
+      const folder = config.folders.find((f) => f.id === FOLDER_ID);
+      const remoteDevices = config.devices
+        .filter((device) => device.deviceID !== myID)
+        .map((device) => {
+          const conn = connections.connections?.[device.deviceID];
+          return {
+            deviceID: device.deviceID,
+            name: device.name || device.deviceID.substring(0, 7),
+            connected: Boolean(conn?.connected),
+          };
+        });
+
+      return {
+        ok: true,
+        myID,
+        folderId: FOLDER_ID,
+        folderPath: folder?.path || '',
+        folderState: folderStatus?.state || (folder ? 'idle' : 'missing'),
+        globalBytes: folderStatus?.globalBytes ?? 0,
+        needBytes: folderStatus?.needBytes ?? 0,
+        devices: remoteDevices,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        error: err.message,
+        starting: Boolean(this._starting),
+      };
+    }
   }
 
   async ensureFolder(saveDir) {
@@ -383,8 +486,29 @@ class SyncthingManager {
     }
   }
 
+  async resolveDeviceID(rawDeviceID) {
+    const prepped = sanitizeDeviceIDInput(rawDeviceID);
+    if (!prepped) {
+      return null;
+    }
+    const local = normalizeDeviceID(prepped);
+    try {
+      await this.ensureReady();
+      const res = await this.apiRequest(
+        'GET',
+        `/rest/svc/deviceid?id=${encodeURIComponent(prepped)}`
+      );
+      if (!res.error && res.id) {
+        return res.id;
+      }
+    } catch (err) {
+      console.warn('[Syncthing] deviceid API fallback:', err.message);
+    }
+    return local;
+  }
+
   async addDevice(rawDeviceID) {
-    const deviceID = normalizeDeviceID(rawDeviceID);
+    const deviceID = await this.resolveDeviceID(rawDeviceID);
     if (!deviceID) {
       throw new Error('Invalid device ID format');
     }

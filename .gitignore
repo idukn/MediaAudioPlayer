@@ -25,6 +25,9 @@ mobile/node_modules/
 mobile/android/
 mobile/.capacitor/
 
+# Termux deb cache (Android ffmpeg bundle build)
+.cache/
+
 # OS Files
 .DS_Store
 

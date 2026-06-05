@@ -1,5 +1,6 @@
 package local.media.audio.finder;
 
+import android.content.Context;
 import android.content.Intent;
 import android.net.Uri;
 import android.os.Environment;
@@ -9,10 +10,13 @@ import android.os.Looper;
 
 import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
+import com.getcapacitor.PermissionState;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
+import com.getcapacitor.annotation.Permission;
+import com.getcapacitor.annotation.PermissionCallback;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -21,6 +25,7 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -31,7 +36,15 @@ import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
-@CapacitorPlugin(name = "MediaAudioFinder")
+@CapacitorPlugin(
+    name = "MediaAudioFinder",
+    permissions = {
+        @Permission(
+            alias = "termuxRun",
+            strings = { "com.termux.permission.RUN_COMMAND" }
+        )
+    }
+)
 public class MediaAudioFinderPlugin extends Plugin {
 
     private static final String LIBRARY_DIR_NAME = "library";
@@ -71,6 +84,11 @@ public class MediaAudioFinderPlugin extends Plugin {
         } catch (Exception e) {
             android.util.Log.e("MediaAudioFinder", "Preview server failed: " + e.getMessage());
         }
+
+        new Thread(() -> {
+            boolean ok = MediaTools.hasWorkingFfmpeg(getContext());
+            android.util.Log.i("MediaAudioFinder", "ffmpeg warmup: " + (ok ? "ok" : "failed"));
+        }, "ffmpeg-warmup").start();
 
         syncthingManager = new SyncthingManager(getContext());
         syncthingManager.bootstrap(getLibraryRoot().getAbsolutePath(), this::emitSyncUpdated);
@@ -130,7 +148,11 @@ public class MediaAudioFinderPlugin extends Plugin {
     }
 
     private void emitSyncUpdated(JSONObject payload) {
-        emitSyncUpdated(jsonToJSObject(payload));
+        try {
+            emitSyncUpdated(jsonToJSObject(payload));
+        } catch (Exception e) {
+            android.util.Log.e("MediaAudioFinder", "emitSyncUpdated failed: " + e.getMessage());
+        }
     }
 
     private JSObject jsonToJSObject(JSONObject json) throws Exception {
@@ -202,9 +224,310 @@ public class MediaAudioFinderPlugin extends Plugin {
         writeTextFile(getPlaylistsFile(), playlists.toString(2));
     }
 
+    private boolean isPathWithinLibrary(File file) throws IOException {
+        File libraryRoot = getLibraryRoot().getCanonicalFile();
+        String libPath = libraryRoot.getPath();
+        String targetPath = file.getCanonicalPath();
+        return targetPath.equals(libPath) || targetPath.startsWith(libPath + File.separator);
+    }
+
+    private String extractLibraryRelativePath(String rawPath) {
+        String normalized = rawPath.replace('\\', '/').trim();
+        String lower = normalized.toLowerCase(Locale.ROOT);
+        String[] markers = new String[] {
+            "/library/",
+            ".media-audio-finder/library/",
+            "media-audio-finder/library/",
+            "/application support/media-audio-finder/library/",
+            "/reference/",
+            "/yt_audio_app/",
+        };
+        String best = "";
+        for (String marker : markers) {
+            int idx = lower.lastIndexOf(marker);
+            if (idx >= 0) {
+                String rel = normalized.substring(idx + marker.length());
+                if (rel.length() > best.length()) {
+                    best = rel;
+                }
+            }
+        }
+        return best;
+    }
+
+    /** パス末尾のセグメントから library 内の実ファイルを探す（Mac 同期パス・相対パス用）。 */
+    private String resolveByPathSuffixes(File libraryRoot, String rawPath) {
+        String normalized = rawPath.replace('\\', '/').trim();
+        String[] parts = normalized.split("/");
+        java.util.ArrayList<String> segments = new java.util.ArrayList<>();
+        for (String part : parts) {
+            if (part != null && !part.isEmpty() && !".".equals(part)) {
+                segments.add(part);
+            }
+        }
+        for (int start = 0; start < segments.size(); start++) {
+            StringBuilder rel = new StringBuilder();
+            for (int i = start; i < segments.size(); i++) {
+                if (rel.length() > 0) {
+                    rel.append('/');
+                }
+                rel.append(segments.get(i));
+            }
+            File candidate = new File(libraryRoot, rel.toString());
+            if (candidate.isFile()) {
+                return candidate.getAbsolutePath();
+            }
+        }
+        return null;
+    }
+
+    private boolean isAbsolutePath(String path) {
+        if (path == null || path.isEmpty()) {
+            return false;
+        }
+        return path.startsWith("/") || path.matches("^[A-Za-z]:[/\\\\].*");
+    }
+
+    private String findAudioFileByName(File dir, String name) {
+        if (dir == null || !dir.isDirectory() || name == null || name.isEmpty()) {
+            return null;
+        }
+        File[] children = dir.listFiles();
+        if (children == null) {
+            return null;
+        }
+        for (File child : children) {
+            if (child.isFile() && child.getName().equalsIgnoreCase(name)) {
+                String lower = child.getName().toLowerCase(Locale.ROOT);
+                for (String ext : AUDIO_EXTS) {
+                    if (lower.endsWith(ext)) {
+                        return child.getAbsolutePath();
+                    }
+                }
+            }
+            if (child.isDirectory()) {
+                String found = findAudioFileByName(child, name);
+                if (found != null) {
+                    return found;
+                }
+            }
+        }
+        return null;
+    }
+
+    /** Mac 同期パスを Android ライブラリ内の実ファイルへ解決する。 */
+    private String resolveLibraryAudioPath(String rawPath) {
+        if (rawPath == null || rawPath.trim().isEmpty()) {
+            return null;
+        }
+        try {
+            File libraryRoot = getLibraryRoot().getCanonicalFile();
+            String trimmed = rawPath.trim();
+            if (trimmed.startsWith("file://")) {
+                trimmed = trimmed.substring(7);
+            }
+            File direct = new File(trimmed);
+            if (direct.isFile() && isPathWithinLibrary(direct)) {
+                return direct.getAbsolutePath();
+            }
+
+            if (!isAbsolutePath(trimmed)) {
+                File relative = new File(libraryRoot, trimmed);
+                if (relative.isFile()) {
+                    return relative.getAbsolutePath();
+                }
+            }
+
+            String rel = extractLibraryRelativePath(trimmed);
+            if (!rel.isEmpty()) {
+                File relFile = new File(libraryRoot, rel);
+                if (relFile.isFile()) {
+                    return relFile.getAbsolutePath();
+                }
+            }
+
+            String suffixResolved = resolveByPathSuffixes(libraryRoot, trimmed);
+            if (suffixResolved != null) {
+                return suffixResolved;
+            }
+
+            String baseName = new File(trimmed.replace('\\', '/')).getName();
+            if (!baseName.isEmpty()) {
+                return findAudioFileByName(libraryRoot, baseName);
+            }
+        } catch (IOException e) {
+            android.util.Log.w("MediaAudioFinder", "resolveLibraryAudioPath failed: " + e.getMessage());
+        }
+        return null;
+    }
+
+    /** ライブラリ内の相対パス（playlists.json 保存用。Mac/Android で共通）。 */
+    private String toStorageLibraryPath(String rawPath) throws IOException {
+        if (rawPath == null || rawPath.trim().isEmpty()) {
+            return "";
+        }
+        String trimmed = rawPath.trim();
+        if (trimmed.startsWith("file://")) {
+            trimmed = trimmed.substring(7);
+        }
+        trimmed = trimmed.replace('\\', '/');
+
+        if (!isAbsolutePath(trimmed)) {
+            return trimmed.replaceAll("^/+", "");
+        }
+
+        File libraryRoot = getLibraryRoot().getCanonicalFile();
+        File direct = new File(trimmed);
+        if (direct.isFile() && isPathWithinLibrary(direct)) {
+            return relativizeUnderLibrary(libraryRoot, direct);
+        }
+
+        String resolved = resolveLibraryAudioPath(trimmed);
+        if (resolved != null) {
+            return relativizeUnderLibrary(libraryRoot, new File(resolved));
+        }
+
+        String rel = extractLibraryRelativePath(trimmed);
+        if (!rel.isEmpty()) {
+            return rel.replace('\\', '/').replaceAll("^/+", "");
+        }
+
+        return new File(trimmed).getName();
+    }
+
+    private String relativizeUnderLibrary(File libraryRoot, File file) throws IOException {
+        String libPath = libraryRoot.getCanonicalPath();
+        String targetPath = file.getCanonicalPath();
+        if (targetPath.equals(libPath)) {
+            return "";
+        }
+        if (targetPath.startsWith(libPath + File.separator)) {
+            return targetPath.substring(libPath.length() + 1).replace('\\', '/');
+        }
+        return file.getName();
+    }
+
+    private JSONObject normalizePlaylistItemForStorage(JSONObject raw) throws Exception {
+        if (raw == null) {
+            return null;
+        }
+        String fullPath = raw.optString("fullPath", raw.optString("path", "")).trim();
+        String webpageUrl = raw.optString("webpageUrl", raw.optString("url", "")).trim();
+        JSONObject normalized = new JSONObject();
+        if (!fullPath.isEmpty()) {
+            fullPath = toStorageLibraryPath(fullPath);
+            if (fullPath.isEmpty()) {
+                return null;
+            }
+            normalized.put("type", "local");
+            normalized.put("fullPath", fullPath);
+            String title = raw.optString("title", "").trim();
+            if (title.isEmpty()) {
+                int slash = Math.max(fullPath.lastIndexOf('/'), fullPath.lastIndexOf('\\'));
+                title = slash >= 0 ? fullPath.substring(slash + 1) : fullPath;
+            }
+            normalized.put("title", title);
+            normalized.put("uploader", raw.optString("uploader", "Local File"));
+            normalized.put("duration", raw.optString("duration", "-"));
+            if (raw.has("durationSec") && !raw.isNull("durationSec")) {
+                normalized.put("durationSec", raw.optDouble("durationSec"));
+            }
+            normalized.put("site", raw.optString("site", "Local"));
+            if (raw.has("id")) {
+                normalized.put("id", raw.optString("id"));
+            }
+            return normalized;
+        }
+        if (!webpageUrl.isEmpty()) {
+            normalized.put("type", "url");
+            normalized.put("webpageUrl", webpageUrl);
+            normalized.put("title", raw.optString("title", "(No title)"));
+            normalized.put("uploader", raw.optString("uploader", "-"));
+            normalized.put("duration", raw.optString("duration", "-"));
+            normalized.put("site", raw.optString("site", "unknown"));
+            if (raw.has("id")) {
+                normalized.put("id", raw.optString("id"));
+            }
+            return normalized;
+        }
+        return null;
+    }
+
+    private JSONObject expandPlaylistItemForClient(JSONObject stored) throws Exception {
+        if (stored == null) {
+            return null;
+        }
+        if (!"local".equals(stored.optString("type", ""))) {
+            return stored;
+        }
+        String storagePath = stored.optString("fullPath", "").trim();
+        if (storagePath.isEmpty()) {
+            return stored;
+        }
+        JSONObject client = new JSONObject(stored.toString());
+        String resolved = resolveLibraryAudioPath(storagePath);
+        if (resolved != null) {
+            client.put("fullPath", resolved);
+        }
+        return client;
+    }
+
+    private JSONArray normalizePlaylistItemsForStorage(JSONArray items) throws Exception {
+        JSONArray normalized = new JSONArray();
+        if (items == null) {
+            return normalized;
+        }
+        for (int i = 0; i < items.length(); i++) {
+            JSONObject item = normalizePlaylistItemForStorage(items.optJSONObject(i));
+            if (item != null) {
+                normalized.put(item);
+            }
+        }
+        return normalized;
+    }
+
+    private JSONArray expandPlaylistItemsForClient(JSONArray storageItems) throws Exception {
+        JSONArray expanded = new JSONArray();
+        if (storageItems == null) {
+            return expanded;
+        }
+        for (int i = 0; i < storageItems.length(); i++) {
+            JSONObject item = expandPlaylistItemForClient(storageItems.optJSONObject(i));
+            if (item != null) {
+                expanded.put(item);
+            }
+        }
+        return expanded;
+    }
+
+    private boolean playlistItemsNeedStorageMigration(JSONArray raw, JSONArray storage) throws Exception {
+        if (raw == null && storage == null) {
+            return false;
+        }
+        if (raw == null || storage == null || raw.length() != storage.length()) {
+            return true;
+        }
+        for (int i = 0; i < raw.length(); i++) {
+            JSONObject before = raw.optJSONObject(i);
+            JSONObject after = storage.optJSONObject(i);
+            if (before == null || after == null) {
+                return true;
+            }
+            String pathBefore = before.optString("fullPath", before.optString("path", "")).trim();
+            String pathAfter = after.optString("fullPath", "").trim();
+            if (!pathBefore.equals(pathAfter)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private String runCommand(List<String> command, long timeoutSec) throws Exception {
         ProcessBuilder builder = new ProcessBuilder(command);
         builder.redirectErrorStream(true);
+        if (!command.isEmpty()) {
+            MediaTools.applyProcessEnvironment(builder, getContext(), command.get(0));
+        }
         Process process = builder.start();
         boolean finished = process.waitFor(timeoutSec, TimeUnit.SECONDS);
         if (!finished) {
@@ -244,9 +567,85 @@ public class MediaAudioFinderPlugin extends Plugin {
         JSObject ret = new JSObject();
         ret.put("platform", "android");
         ret.put("platformLabel", "Android");
-        ret.put("fileManagerLabel", "ファイル");
+        ret.put("fileManagerLabel", "ファイルマネージャ");
         ret.put("libraryDir", getLibraryRoot().getAbsolutePath());
         call.resolve(ret);
+    }
+
+    @PluginMethod
+    public void getMediaToolsDiagnostics(PluginCall call) {
+        Context ctx = getContext();
+        JSObject ret = new JSObject();
+        ret.put("bundledFfmpeg", NativeBinaryResolver.resolveBundledFfmpeg(ctx) != null);
+        ret.put("ffmpegWorks", MediaTools.hasWorkingFfmpeg(ctx));
+        ret.put("ytdlpInTermux", MediaTools.isYtdlpInstalledInTermux());
+        ret.put("ytdlpDirectExec", MediaTools.resolveYtdlp(ctx) != null);
+        ret.put("termuxPackage", TermuxDetector.findInstalledPackage(ctx));
+        ret.put("termuxVersion", TermuxDetector.getTermuxVersionName(ctx));
+        ret.put("termuxVersionCode", TermuxDetector.getTermuxVersionCode(ctx));
+        ret.put("termuxGooglePlayBuild", TermuxDetector.isGooglePlayBuild(ctx));
+        ret.put("termuxVersionSupported", TermuxDetector.isTermuxVersionLikelySupported(ctx));
+        ret.put("termuxInstalled", TermuxCommandRunner.isTermuxInstalled(ctx));
+        ret.put("termuxRunCommandDefined", TermuxDetector.isRunCommandPermissionDefined(ctx));
+        ret.put("termuxRunCommandPermission", TermuxCommandRunner.hasRunCommandPermission(ctx));
+        ret.put("termuxPermissionState", getPermissionState("termuxRun").toString());
+        ret.put("termuxSetupHint", TermuxCommandRunner.getSetupHint(ctx));
+        if (TermuxDetector.isRunCommandPermissionDefined(ctx)) {
+            ret.put("adbGrantCommand",
+                "adb shell pm grant " + ctx.getPackageName() + " com.termux.permission.RUN_COMMAND");
+        } else {
+            ret.put("adbGrantCommand", "(この端末では Unknown permission — 公式 Termux/F-Droid が必要)");
+        }
+        call.resolve(ret);
+    }
+
+    @PluginMethod
+    public void requestTermuxRunPermission(PluginCall call) {
+        Context ctx = getContext();
+        if (!TermuxCommandRunner.isTermuxInstalled(ctx)) {
+            call.reject("Termux がインストールされていません");
+            return;
+        }
+        if (TermuxCommandRunner.hasRunCommandPermission(ctx)) {
+            JSObject ret = new JSObject();
+            ret.put("granted", true);
+            call.resolve(ret);
+            return;
+        }
+        if (getPermissionState("termuxRun") == PermissionState.GRANTED) {
+            JSObject ret = new JSObject();
+            ret.put("granted", true);
+            call.resolve(ret);
+            return;
+        }
+        requestPermissionForAlias("termuxRun", call, "termuxRunPermsCallback");
+    }
+
+    @PermissionCallback
+    private void termuxRunPermsCallback(PluginCall call) {
+        boolean granted = TermuxCommandRunner.hasRunCommandPermission(getContext());
+        JSObject ret = new JSObject();
+        ret.put("granted", granted);
+        ret.put("permissionState", getPermissionState("termuxRun").toString());
+        if (!granted) {
+            ret.put("hint", TermuxCommandRunner.getSetupHint(getContext()));
+            ret.put("adbGrantCommand",
+                "adb shell pm grant " + getContext().getPackageName() + " com.termux.permission.RUN_COMMAND");
+        }
+        call.resolve(ret);
+    }
+
+    @PluginMethod
+    public void openAppPermissionSettings(PluginCall call) {
+        try {
+            Intent intent = new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
+            intent.setData(Uri.parse("package:" + getContext().getPackageName()));
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            getContext().startActivity(intent);
+            call.resolve();
+        } catch (Exception e) {
+            call.reject(e.getMessage());
+        }
     }
 
     @PluginMethod
@@ -297,9 +696,23 @@ public class MediaAudioFinderPlugin extends Plugin {
     public void getPlaylists(PluginCall call) {
         try {
             JSONArray playlists = readPlaylistsArray();
+            boolean dirty = false;
             JSArray arr = new JSArray();
             for (int i = 0; i < playlists.length(); i++) {
-                arr.put(playlists.getJSONObject(i));
+                JSONObject playlist = playlists.getJSONObject(i);
+                JSONArray rawItems = playlist.optJSONArray("items");
+                JSONArray storageItems = normalizePlaylistItemsForStorage(rawItems);
+                if (playlistItemsNeedStorageMigration(rawItems, storageItems)) {
+                    dirty = true;
+                    playlist.put("items", storageItems);
+                }
+                JSONObject clientPlaylist = new JSONObject(playlist.toString());
+                clientPlaylist.put("items", expandPlaylistItemsForClient(storageItems));
+                arr.put(clientPlaylist);
+            }
+            if (dirty) {
+                writePlaylistsArray(playlists);
+                android.util.Log.i("MediaAudioFinder", "Migrated playlist paths to library-relative format");
             }
             JSObject ret = new JSObject();
             ret.put("playlists", arr);
@@ -365,7 +778,10 @@ public class MediaAudioFinderPlugin extends Plugin {
             }
             int added = 0;
             for (int i = 0; i < items.length(); i++) {
-                JSONObject item = items.getJSONObject(i);
+                JSONObject item = normalizePlaylistItemForStorage(items.getJSONObject(i));
+                if (item == null) {
+                    continue;
+                }
                 existing.put(item);
                 added++;
             }
@@ -513,7 +929,11 @@ public class MediaAudioFinderPlugin extends Plugin {
             }
             File dir = new File(saveDir);
             dir.mkdirs();
-            String ytdlp = ExecutableResolver.resolve(getContext(), "yt-dlp");
+            String ytdlp = MediaTools.resolveYtdlp(getContext());
+            if (ytdlp == null) {
+                call.reject("yt-dlp が見つかりません。Termux で pkg install yt-dlp ffmpeg を実行してください");
+                return;
+            }
             List<String> command = new ArrayList<>();
             command.add(ytdlp);
             command.add("-x");
@@ -540,7 +960,11 @@ public class MediaAudioFinderPlugin extends Plugin {
                 call.reject("検索キーワードを入力してください");
                 return;
             }
-            String ytdlp = ExecutableResolver.resolve(getContext(), "yt-dlp");
+            String ytdlp = MediaTools.resolveYtdlp(getContext());
+            if (ytdlp == null) {
+                call.reject("yt-dlp が見つかりません。Termux で pkg install yt-dlp ffmpeg を実行してください");
+                return;
+            }
             List<String> command = new ArrayList<>();
             command.add(ytdlp);
             command.add("--flat-playlist");
@@ -580,22 +1004,46 @@ public class MediaAudioFinderPlugin extends Plugin {
 
     @PluginMethod
     public void openInFinder(PluginCall call) {
-        try {
-            String filePath = call.getString("filePath", "");
-            if (filePath.isEmpty()) {
-                call.resolve();
-                return;
-            }
-            File file = new File(filePath);
-            Uri uri = Uri.parse("file://" + (file.isDirectory() ? file.getAbsolutePath() : file.getParent()));
-            Intent intent = new Intent(Intent.ACTION_VIEW);
-            intent.setDataAndType(uri, "*/*");
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            getContext().startActivity(Intent.createChooser(intent, "Open folder"));
-            call.resolve();
-        } catch (Exception e) {
-            call.reject(e.getMessage());
+        if (getActivity() == null) {
+            call.reject("アプリが前面にありません");
+            return;
         }
+        getActivity().runOnUiThread(() -> {
+            try {
+                String filePath = call.getString("filePath", "");
+                File target;
+                if (filePath.isEmpty()) {
+                    target = getLibraryRoot();
+                } else {
+                    target = new File(filePath).getCanonicalFile();
+                }
+                File libraryRoot = getLibraryRoot().getCanonicalFile();
+                String libPath = libraryRoot.getPath();
+                String targetPath = target.getPath();
+                if (!targetPath.equals(libPath) && !targetPath.startsWith(libPath + File.separator)) {
+                    call.reject("ライブラリ外のパスは開けません");
+                    return;
+                }
+                File folder = target.isDirectory() ? target : target.getParentFile();
+                if (folder == null || !folder.exists()) {
+                    call.reject("フォルダが見つかりません");
+                    return;
+                }
+
+                Context ctx = getContext();
+                if (FileManagerOpener.openFolder(ctx, folder)) {
+                    call.resolve();
+                    return;
+                }
+                FileManagerOpener.copyPathAndNotify(ctx, folder.getAbsolutePath());
+                JSObject ret = new JSObject();
+                ret.put("fallback", "clipboard");
+                ret.put("path", folder.getAbsolutePath());
+                call.resolve(ret);
+            } catch (Exception e) {
+                call.reject(e.getMessage() != null ? e.getMessage() : "フォルダを開けませんでした");
+            }
+        });
     }
 
     @PluginMethod
@@ -620,10 +1068,20 @@ public class MediaAudioFinderPlugin extends Plugin {
     }
 
     @PluginMethod
+    public void resolveLibraryPath(PluginCall call) {
+        String path = call.getString("path", call.getString("fullPath", "")).trim();
+        String resolved = resolveLibraryAudioPath(path);
+        JSObject ret = new JSObject();
+        ret.put("found", resolved != null && !resolved.isEmpty());
+        ret.put("path", resolved != null ? resolved : "");
+        call.resolve(ret);
+    }
+
+    @PluginMethod
     public void syncthingGetInfo(PluginCall call) {
         new Thread(() -> {
             try {
-                JSONObject info = syncthingManager.getInfo();
+                JSONObject info = syncthingManager.getInfo(getLibraryRoot().getAbsolutePath());
                 JSObject ret = jsonToJSObject(info);
                 call.resolve(ret);
             } catch (Exception e) {
@@ -631,6 +1089,7 @@ public class MediaAudioFinderPlugin extends Plugin {
                 ret.put("ok", false);
                 ret.put("error", e.getMessage());
                 ret.put("libraryPath", getLibraryRoot().getAbsolutePath());
+                ret.put("starting", false);
                 call.resolve(ret);
             }
         }, "syncthing-get-info").start();
@@ -642,7 +1101,7 @@ public class MediaAudioFinderPlugin extends Plugin {
         new Thread(() -> {
             try {
                 JSONObject res = syncthingManager.addDevice(deviceID);
-                JSONObject info = syncthingManager.getInfo();
+                JSONObject info = syncthingManager.getInfo(getLibraryRoot().getAbsolutePath());
                 JSObject ret = jsonToJSObject(info);
                 ret.put("success", res.optBoolean("success", true));
                 call.resolve(ret);
