@@ -25,12 +25,14 @@
 
 ### Android
 
-APK 単体では yt-dlp / ffmpeg が同梱されません。次のいずれかが必要です。
+**Linux 開発環境（Debian Terminal）** 内のメディアサーバー（`yt-dlp` + `ffmpeg` ライブ pipe）が必要です。APK 単体では YouTube 試聴・検索・ダウンロードは動きません。
 
-- [Termux](https://termux.dev/) 等で `pkg install yt-dlp ffmpeg` を実行し、PATH が通る状態にする
-- 将来の APK 同梱版（予定）
+1. 開発者向けオプション → **Linux 開発環境** を有効化
+2. Terminal アプリで Debian をインストール
+3. リポジトリを VM にコピーし `./scripts/setup-debian-media-server.sh` を実行
+4. Terminal 設定で **ポート 8765** の転送を許可
 
-**試聴ストリーム** は Android プラグインで有効です（APK 同梱 ffmpeg + Invidious API。**ネット接続必須**）。**Syncthing 内蔵** は APK ビルド時にバイナリ同梱が必要です（下記スクリプト）。試聴・検索・ダウンロードの検索/ダウンロードには Android では別途 yt-dlp が必要な場合があります。
+**Syncthing 同期** は APK 内蔵（ビルド時に `libsyncthing.so` 同梱）。
 
 ---
 
@@ -68,13 +70,84 @@ npm run build:win
 
 ## Android（APK）
 
-### 1. 依存関係
+### 1. 依存関係（PC 側）
 
 - Node.js 20+
 - Android Studio（SDK）/ JDK 21（`brew install openjdk@21` でも可）
-- `yt-dlp`（端末または Termux、上記参照）
+- arm64 実機（USB デバッグ ON）
 
-### 2. セットアップ
+### 2. 依存関係（端末側・Debian VM）
+
+- Android 15+ / 16 の **Linux 開発環境**（Terminal アプリ）
+- VM 内: `nodejs`, `yt-dlp`, `ffmpeg`（`setup-debian-media-server.sh` が自動インストール）
+- **ポート 8765** を Android ホストへ転送（Terminal アプリ設定）
+
+### 3. Debian メディアサーバーのセットアップ（端末・1 回）
+
+**注意:** `adb push` の先は **Android 本体**（`/sdcard` 等）です。`/home/droid` は Debian VM 内のパスなので `Read-only file system` になります。
+
+#### PC からリポジトリを送る
+
+**リポジトリ全体**の `adb push` は `dist/` 内のシンボリックリンク等で失敗します。必要ファイルだけ送るスクリプトを使ってください:
+
+```bash
+# Mac（USB デバッグ ON）
+./scripts/push-debian-setup-to-android.sh
+```
+
+内部で `/storage/emulated/0/Download/yt_audio_app` に展開します（`/sdcard` は adb 上では `/storage/emulated/0` へのリンクです。Debian Terminal 内からは `/sdcard` が見えないことがあります）。
+
+#### Debian Terminal 内で実行
+
+Terminal アプリを開き、共有ストレージのマウントを確認してからセットアップします:
+
+```bash
+ls /mnt/shared
+# 例: /mnt/shared/0/Download/yt_audio_app が見える
+
+cd /mnt/shared/0/Download/yt_audio_app
+chmod +x scripts/setup-debian-media-server.sh
+./scripts/setup-debian-media-server.sh
+```
+
+`/mnt/shared/0/...` のパスが端末で異なる場合は `ls /mnt/shared` で Download フォルダを探してください。git が使えるなら VM 内で `git clone` でも構いません（`shared/media-server/` と `scripts/` が必要）。
+
+確認:
+
+```bash
+curl http://127.0.0.1:8765/health
+# Android Chrome からも http://127.0.0.1:8765/health が {"ok":true} なら OK
+```
+
+ライブラリパス（virtiofs）が端末と異なる場合は `LIBRARY_ROOT=... ./scripts/setup-debian-media-server.sh` で指定してください。デフォルト:
+
+`/mnt/shared/0/Android/data/local.media.audio.finder/files/library`
+
+#### メディアサーバーの更新（YouTube 試聴など）
+
+`update-vm-media-server.sh` は **Mac のリポジトリにのみ** あります。VM 内に無い場合は、Mac から再プッシュしてください:
+
+```bash
+# Mac
+./scripts/push-debian-setup-to-android.sh
+```
+
+Debian Terminal 内:
+
+```bash
+cd /mnt/shared/0/Download/yt_audio_app   # ls /mnt/shared でパスを確認
+./scripts/update-vm-media-server.sh
+```
+
+スクリプトがまだ無い場合は、次の 3 行だけでも更新できます:
+
+```bash
+REPO=/mnt/shared/0/Download/yt_audio_app   # パスは環境に合わせる
+cp "$REPO/shared/media-server/index.js" "$HOME/media-audio-finder-server/index.js"
+systemctl --user restart media-audio-finder && curl -sf http://127.0.0.1:8765/health
+```
+
+### 4. APK ビルド（PC）
 
 ```bash
 cd mobile
@@ -84,29 +157,21 @@ npm run sync:www
 npm run cap:sync
 ```
 
-### 3. ネイティブバイナリ（Android 内蔵機能を使う場合）
+ネイティブ（Syncthing のみ）:
 
 ```bash
 ./scripts/build-syncthing-android.sh
-./scripts/build-media-tools-android.sh
 ```
 
-- Syncthing: `jniLibs/arm64-v8a/libsyncthing.so`（約 27MB）
-- ffmpeg: `libffmpeg.so` + Termux 依存ライブラリ一式（`build-media-tools-android.sh` で patchelf 改名して同梱、APK は約 60MB+）。試聴・WAV 再生に使用。Termux の `ffmpeg` は別アプリから実行できないため APK 同梱が必須
+`./build_and_install_android_app.sh` は初回に Syncthing 同梱を自動実行します（ffmpeg 同梱は不要）。
 
-`./build_and_install_android_app.sh` は初回に上記を自動実行します。
-
-### 4. ビルドと端末へのインストール（推奨）
-
-USB デバッグ有効な端末、またはエミュレータを接続して:
+### 5. ビルドと端末へのインストール（推奨）
 
 ```bash
 ./build_and_install_android_app.sh
 ```
 
-初回は `npx cap add android` まで自動実行します。複数端末がある場合は `ANDROID_SERIAL=... ./build_and_install_android_app.sh` で指定できます。
-
-### 5. Android Studio でビルド（任意）
+### 6. Android Studio でビルド（任意）
 
 ```bash
 cd mobile
@@ -141,100 +206,34 @@ npm run cap:sync
 
 PATH に追加後、アプリを再起動してください。
 
-### Android で検索・ダウンロードが失敗する
+### Android で検索・ダウンロード・試聴が失敗する
 
-端末で `yt-dlp --version` が動くか確認してください。動かない場合は Termux 等でインストールしてください。
+Debian VM 内のメディアサーバー（ポート **8765**）に接続できていません。
+
+1. Terminal 内: `systemctl --user status media-audio-finder`
+2. Terminal 内: `curl http://127.0.0.1:8765/health` → `ok: true`（**VM 内**の成功だけでは不十分）
+3. Terminal アプリ **歯車** → リスニングポート **8765** を追加
+4. **サーバーを再起動**（転送を再検知させる）:
+   ```bash
+   systemctl --user restart media-audio-finder
+   ```
+5. バインド時の **ポート転送ポップアップ** を許可
+6. Mac から Android 側を確認:
+   ```bash
+   adb shell ss -ltn | grep 8765
+   ```
+   `127.0.0.1:8765` が `LISTEN` なら転送 OK
+7. Android Chrome で `http://127.0.0.1:8765/health`（**https 不可**）を開く
+
+**VM 内 curl は成功するのに Chrome だけ connection refused** になる典型原因は、Android ホスト側に 8765 の転送リスナーがまだ立っていないことです。Terminal（Debian VM）を起動したまま、上記 3〜6 を実施してください。
+
+YouTube **試聴**は Mac 版と同様 **yt-dlp → ffmpeg のライブ pipe**（`/stream?url=`）です。キャッシュ待ちはありません。
+
+アプリ内: `await window.api.getMediaToolsDiagnostics()` で接続状態を確認できます。
 
 ### プレイリストが表示されない
 
 ライブラリ内の `playlists.json` を確認してください。旧 macOS 版の `/Volumes/...` からは mac 起動時のみ自動移行します。
-
-### Android で試聴が失敗する
-
-**YouTube 試聴** は Mac 版と同様に **yt-dlp → ffmpeg のリアルタイムパイプ** で配信します（チャンクストリーム）。Termux に `yt-dlp` と `ffmpeg` があると Mac に最も近い動作になります。Termux がない場合は URL 取得 + ffmpeg パイプにフォールバックします。
-
-```bash
-# Termux（検索・ダウンロード・試聴すべて）
-pkg update && pkg install yt-dlp ffmpeg python
-
-# APK 再ビルド（同梱 ffmpeg）
-./scripts/build-media-tools-android.sh
-./build_and_install_android_app.sh
-```
-
-**注意**: Syncthing 用に Termux を入れているだけでは yt-dlp は使えません。Termux 内で上記 `pkg install` が必要です。
-
-**Termux に yt-dlp を入れているのに試聴だけ失敗する場合**（よくある）:
-
-Android では **他アプリから Termux 内の `/data/data/com.termux/.../yt-dlp` を直接実行できません**（インストール済みでもアプリは見えない/実行不可）。次を設定してください。
-
-1. **Termux** で `pkg install yt-dlp ffmpeg`（済みなら不要）
-2. **Termux** で外部アプリ連携を有効化:
-   ```bash
-   mkdir -p ~/.termux
-   echo 'allow-external-apps=true' >> ~/.termux/termux.properties
-   ```
-   Termux アプリを完全終了して再起動
-3. **Termux** にストレージ権限: `termux-setup-storage` を実行
-4. **権限の付与**（公式 Termux の場合のみ）:
-   - 使うのは **F-Droid の公式 Termux** (`com.termux`) であること。Play 版・別名アプリでは `RUN_COMMAND` 権限が存在せず、**設定にも adb にも出ません**。
-   - YouTube 試聴を開き「Termux でコマンドを実行」ダイアログが出たら許可
-   - `adb shell pm grant` が **`Unknown permission`** になる場合 → **Termux が非公式か未インストール**です。grant は使えません。
-
-**YouTube 試聴の本体**は Termux が無くても **Piped / Invidious の公開 API** で動作します（アプリがインスタンス一覧を自動取得）。Termux の yt-dlp は API が全部落ちているときの予備です。
-
-### Google Play 版 Termux（`versionName=googleplay.*`）について
-
-`adb shell dumpsys package com.termux | grep versionName` が **`googleplay.2026.xx.xx`** の場合、それは **Google Play 版 Termux** です。
-
-このビルドは **RUN_COMMAND をシステムに登録しない** ため、
-
-- 設定に「Termux でコマンドを実行」が**出ない**
-- `adb shell pm grant ... RUN_COMMAND` が **Unknown permission**
-- Termux 内の `yt-dlp` は動いても **本アプリからは使えない**
-
-**対処（Termux 連携を使いたい場合のみ）:**
-
-1. Google Play 版 Termux を**アンインストール**
-2. [F-Droid の Termux](https://f-droid.org/packages/com.termux/) をインストール（`versionName` が `0.118.x` など **googleplay でない**こと）
-3. Termux 内で `pkg install yt-dlp ffmpeg`、上記 `allow-external-apps` 設定
-
-**YouTube 試聴**は F-Droid 版が無くても **Invidious API** で動作します（Termux 不要）。
-
-### RUN_COMMAND が Unknown permission のとき（com.termux はある）
-
-**アプリ側から権限を「新規登録」することはできません。** Termux APK がインストールされたときに初めてシステムに登録されます。
-
-端末で確認:
-
-```bash
-adb shell pm list packages | grep termux
-adb shell dumpsys package com.termux | grep versionName
-adb shell pm list permissions | grep -i run_command
-```
-
-| 結果 | 対処 |
-|------|------|
-| `grep run_command` が何も出ない | Termux が古い／壊れている → **F-Droid で公式 Termux を再インストール**（0.118 以降） |
-| 権限は出るが grant できない | Media Audio Finder で YouTube 試聴を1回開き、ダイアログで許可 |
-| それでも不可 | **Termux 連携は諦めて OK**（YouTube は Invidious API のみで動作） |
-
-Termux 再インストール後:
-
-```bash
-# Termux 内
-pkg update && pkg upgrade
-pkg install yt-dlp ffmpeg
-mkdir -p ~/.termux && echo 'allow-external-apps=true' >> ~/.termux/termux.properties
-# Termux を完全終了→再起動、termux-setup-storage
-
-# PC（権限が登録された後だけ成功する）
-adb shell pm grant local.media.audio.finder com.termux.permission.RUN_COMMAND
-```
-
-**恒久対策（開発側）**: APK に yt-dlp を同梱すれば Termux 不要になります（ffmpeg 同梱と同様）。現状は Invidious + 同梱 ffmpeg が主経路です。
-
-アプリ内の開発者向け: `await window.api.getMediaToolsDiagnostics()` で `termuxRunCommandPermission` と `adbGrantCommand` を確認できます。
 
 ### Android で Syncthing の localhost (127.0.0.1:8384) に接続できない
 

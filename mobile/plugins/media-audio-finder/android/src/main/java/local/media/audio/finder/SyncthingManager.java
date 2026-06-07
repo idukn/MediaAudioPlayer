@@ -9,10 +9,12 @@ import org.json.JSONObject;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileWriter;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.nio.file.Files;
 import java.util.concurrent.TimeUnit;
 import java.net.HttpURLConnection;
 import java.net.URL;
@@ -27,6 +29,17 @@ import java.util.regex.Pattern;
 final class SyncthingManager {
 
     static final String FOLDER_ID = "yt-audio-app-sync";
+    private static final String PRIMARY_DEVICE_FILE = ".sync-primary-device-id";
+    private static final String[] SYNC_EXCLUDED_NAMES = new String[] {
+        ".ui-state.json",
+        "ui-state.json",
+        ".search-cache",
+        "search-cache.json",
+        "queries.json",
+        "metadata.json",
+        ".preview-cache",
+        ".stream-work",
+    };
     private static final Pattern DEVICE_ID_GROUPED_RE =
         Pattern.compile("^[A-Z2-7]{7}(-[A-Z2-7]{7}){6,7}$");
 
@@ -210,9 +223,10 @@ final class SyncthingManager {
             }
 
             List<String> command = syncthingCommand(
+                "-H", configDir.getAbsolutePath(),
+                "serve",
                 "--no-browser",
-                "--no-restart",
-                "--home=" + configDir.getAbsolutePath()
+                "--no-restart"
             );
             ProcessBuilder builder = new ProcessBuilder(command);
             builder.redirectErrorStream(true);
@@ -281,6 +295,7 @@ final class SyncthingManager {
                     listener.onSyncEvent(readyPayload);
                 }
                 ensureFolder(saveDir);
+                ensureSyncExclusions(saveDir);
                 waitForApi(120);
                 JSONObject result = runStartupSync();
                 if (listener != null) {
@@ -613,9 +628,8 @@ final class SyncthingManager {
         }
         android.util.Log.i("Syncthing", "Generating initial config.xml ...");
         List<String> command = syncthingCommand(
-            "--home=" + configDir.getAbsolutePath(),
-            "generate",
-            "--no-default-folder"
+            "-H", configDir.getAbsolutePath(),
+            "generate"
         );
         ProcessBuilder builder = new ProcessBuilder(command);
         builder.redirectErrorStream(true);
@@ -656,18 +670,16 @@ final class SyncthingManager {
     }
 
     private boolean verifyBinaryRunnable(File binary) {
-        for (String versionFlag : new String[]{"-version", "--version"}) {
-            if (probeSyncthingVersion(binary, versionFlag)) {
-                return true;
-            }
+        if (probeSyncthingVersion(binary, "--version")) {
+            return true;
         }
-        return false;
+        return probeSyncthingVersion(binary, "version");
     }
 
-    private boolean probeSyncthingVersion(File binary, String versionFlag) {
+    private boolean probeSyncthingVersion(File binary, String... versionArgs) {
         Process probe = null;
         try {
-            List<String> command = syncthingCommand(versionFlag);
+            List<String> command = syncthingCommand(versionArgs);
             ProcessBuilder builder = new ProcessBuilder(command);
             builder.redirectErrorStream(true);
             applySyncthingEnvironment(builder);
@@ -686,7 +698,7 @@ final class SyncthingManager {
             boolean finished = probe.waitFor(12, TimeUnit.SECONDS);
             if (!finished) {
                 probe.destroyForcibly();
-                lastStartError = "syncthing " + versionFlag + " timed out";
+                lastStartError = "syncthing version probe timed out";
                 return false;
             }
             int exit = probe.exitValue();
@@ -698,7 +710,7 @@ final class SyncthingManager {
             }
             boolean looksValid = lower.contains("syncthing") || lower.contains("version");
             if (!looksValid) {
-                lastStartError = "syncthing " + versionFlag + " exit=" + exit + " out=" + text;
+                lastStartError = "syncthing version probe exit=" + exit + " out=" + text;
                 return false;
             }
             if (exit != 0) {
@@ -881,6 +893,7 @@ final class SyncthingManager {
             apiRequest("POST", "/rest/system/config", config);
             apiRequest("POST", "/rest/system/restart", null);
             waitForApi();
+            ensureSyncExclusions(saveDir);
             return;
         }
 
@@ -890,6 +903,100 @@ final class SyncthingManager {
             apiRequest("POST", "/rest/system/restart", null);
             waitForApi();
         }
+        ensureSyncExclusions(saveDir);
+    }
+
+    private void ensureSyncExclusions(String libraryPath) {
+        try {
+            writeStignore(libraryPath);
+            ensurePrimaryDeviceMarker(libraryPath);
+            cleanupNonPrimaryCache(libraryPath);
+        } catch (Exception e) {
+            android.util.Log.w("Syncthing", "ensureSyncExclusions: " + e.getMessage());
+        }
+    }
+
+    private void writeStignore(String libraryPath) throws Exception {
+        File library = new File(libraryPath);
+        if (!library.exists() && !library.mkdirs()) {
+            return;
+        }
+        File stignore = new File(library, ".stignore");
+        String content =
+            "// Local-only cache and UI state (not synced)\n"
+                + ".ui-state.json\n"
+                + "ui-state.json\n"
+                + ".search-cache\n"
+                + "search-cache.json\n"
+                + "queries.json\n"
+                + "metadata.json\n"
+                + ".preview-cache\n"
+                + ".stream-work\n";
+        try (FileWriter writer = new FileWriter(stignore, false)) {
+            writer.write(content);
+        }
+    }
+
+    private void ensurePrimaryDeviceMarker(String libraryPath) throws Exception {
+        File marker = new File(libraryPath, PRIMARY_DEVICE_FILE);
+        String myId = readLocalDeviceIdFromConfig();
+        if (myId.isEmpty()) {
+            return;
+        }
+        String formatted = normalizeDeviceID(myId);
+        if (formatted != null) {
+            myId = formatted;
+        }
+        if (!marker.isFile()) {
+            try (FileWriter writer = new FileWriter(marker, false)) {
+                writer.write(myId.trim());
+            }
+            return;
+        }
+        String existing = readSmallTextFile(marker).trim();
+        if (existing.isEmpty()) {
+            try (FileWriter writer = new FileWriter(marker, false)) {
+                writer.write(myId.trim());
+            }
+        }
+    }
+
+    private void cleanupNonPrimaryCache(String libraryPath) throws Exception {
+        File marker = new File(libraryPath, PRIMARY_DEVICE_FILE);
+        String primaryId = marker.isFile() ? readSmallTextFile(marker).trim() : "";
+        String myId = readLocalDeviceIdFromConfig();
+        String formattedMyId = normalizeDeviceID(myId);
+        if (formattedMyId != null) {
+            myId = formattedMyId;
+        }
+        if (primaryId.isEmpty() || myId.isEmpty() || primaryId.equals(myId)) {
+            return;
+        }
+        android.util.Log.i("Syncthing", "Removing non-primary cache on secondary device");
+        for (String name : SYNC_EXCLUDED_NAMES) {
+            deleteRecursively(new File(libraryPath, name));
+        }
+    }
+
+    private String readSmallTextFile(File file) throws Exception {
+        byte[] bytes = Files.readAllBytes(file.toPath());
+        return new String(bytes, StandardCharsets.UTF_8);
+    }
+
+    private void deleteRecursively(File target) {
+        if (target == null || !target.exists()) {
+            return;
+        }
+        if (target.isDirectory()) {
+            File[] children = target.listFiles();
+            if (children != null) {
+                for (File child : children) {
+                    deleteRecursively(child);
+                }
+            }
+        }
+        //noinspection ResultOfMethodCallIgnored
+        target.delete();
     }
 
     private JSONObject runStartupSync() throws Exception {

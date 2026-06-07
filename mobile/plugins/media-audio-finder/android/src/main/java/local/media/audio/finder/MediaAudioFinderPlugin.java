@@ -10,23 +10,18 @@ import android.os.Looper;
 
 import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
-import com.getcapacitor.PermissionState;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
-import com.getcapacitor.annotation.Permission;
-import com.getcapacitor.annotation.PermissionCallback;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
-import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -34,18 +29,13 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
-import java.util.concurrent.TimeUnit;
 
-@CapacitorPlugin(
-    name = "MediaAudioFinder",
-    permissions = {
-        @Permission(
-            alias = "termuxRun",
-            strings = { "com.termux.permission.RUN_COMMAND" }
-        )
-    }
-)
+@CapacitorPlugin(name = "MediaAudioFinder")
 public class MediaAudioFinderPlugin extends Plugin {
+
+    static final int MEDIA_SERVER_PORT = 8765;
+    static final String DEFAULT_VM_LIBRARY_ROOT =
+        "/mnt/shared/0/Android/data/local.media.audio.finder/files/library";
 
     private static final String LIBRARY_DIR_NAME = "library";
     private static final String PLAYLISTS_FILE = "playlists.json";
@@ -53,7 +43,6 @@ public class MediaAudioFinderPlugin extends Plugin {
         ".mp3", ".m4a", ".aac", ".webm", ".wav", ".ogg", ".flac", ".opus", ".wma"
     ));
 
-    private PreviewStreamServer previewStreamServer;
     private SyncthingManager syncthingManager;
     private FileObserver libraryObserver;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -79,17 +68,6 @@ public class MediaAudioFinderPlugin extends Plugin {
     @Override
     public void load() {
         super.load();
-        try {
-            previewStreamServer = new PreviewStreamServer(getContext(), this::getLibraryRoot);
-        } catch (Exception e) {
-            android.util.Log.e("MediaAudioFinder", "Preview server failed: " + e.getMessage());
-        }
-
-        new Thread(() -> {
-            boolean ok = MediaTools.hasWorkingFfmpeg(getContext());
-            android.util.Log.i("MediaAudioFinder", "ffmpeg warmup: " + (ok ? "ok" : "failed"));
-        }, "ffmpeg-warmup").start();
-
         syncthingManager = new SyncthingManager(getContext());
         syncthingManager.bootstrap(getLibraryRoot().getAbsolutePath(), this::emitSyncUpdated);
         setupLibraryWatcher();
@@ -103,10 +81,6 @@ public class MediaAudioFinderPlugin extends Plugin {
         }
         if (syncthingManager != null) {
             syncthingManager.stop();
-        }
-        if (previewStreamServer != null) {
-            previewStreamServer.stop();
-            previewStreamServer = null;
         }
         super.handleOnDestroy();
     }
@@ -522,31 +496,6 @@ public class MediaAudioFinderPlugin extends Plugin {
         return false;
     }
 
-    private String runCommand(List<String> command, long timeoutSec) throws Exception {
-        ProcessBuilder builder = new ProcessBuilder(command);
-        builder.redirectErrorStream(true);
-        if (!command.isEmpty()) {
-            MediaTools.applyProcessEnvironment(builder, getContext(), command.get(0));
-        }
-        Process process = builder.start();
-        boolean finished = process.waitFor(timeoutSec, TimeUnit.SECONDS);
-        if (!finished) {
-            process.destroyForcibly();
-            throw new Exception("Command timed out");
-        }
-        BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8));
-        StringBuilder output = new StringBuilder();
-        String line;
-        while ((line = reader.readLine()) != null) {
-            output.append(line).append('\n');
-        }
-        reader.close();
-        if (process.exitValue() != 0) {
-            throw new Exception(output.toString().trim());
-        }
-        return output.toString();
-    }
-
     @PluginMethod
     public void getLibraryDir(PluginCall call) {
         JSObject ret = new JSObject();
@@ -557,9 +506,38 @@ public class MediaAudioFinderPlugin extends Plugin {
     @PluginMethod
     public void getAudioServerPort(PluginCall call) {
         JSObject ret = new JSObject();
-        int port = previewStreamServer != null ? previewStreamServer.getBoundPort() : 0;
-        ret.put("port", port);
+        ret.put("port", MEDIA_SERVER_PORT);
         call.resolve(ret);
+    }
+
+    @PluginMethod
+    public void getMediaServerConfig(PluginCall call) {
+        JSObject ret = new JSObject();
+        ret.put("port", MEDIA_SERVER_PORT);
+        ret.put("androidLibraryRoot", getLibraryRoot().getAbsolutePath());
+        ret.put("vmLibraryRoot", DEFAULT_VM_LIBRARY_ROOT);
+        ret.put("localAudioPort", LocalAudioHttpServer.DEFAULT_PORT);
+        call.resolve(ret);
+    }
+
+    @PluginMethod
+    public void getLocalAudioStreamUrl(PluginCall call) {
+        String rawPath = call.getString("path", call.getString("fullPath", "")).trim();
+        String resolved = resolveLibraryAudioPath(rawPath);
+        if (resolved == null || resolved.isEmpty()) {
+            call.reject("ファイルが見つかりません: " + rawPath);
+            return;
+        }
+        try {
+            LocalAudioHttpServer server = LocalAudioHttpServer.ensureStarted(getContext(), getLibraryRoot());
+            String url = server.buildAudioUrl(resolved);
+            JSObject ret = new JSObject();
+            ret.put("url", url);
+            ret.put("path", resolved);
+            call.resolve(ret);
+        } catch (Exception e) {
+            call.reject("ローカル再生 URL の生成に失敗: " + e.getMessage());
+        }
     }
 
     @PluginMethod
@@ -574,78 +552,12 @@ public class MediaAudioFinderPlugin extends Plugin {
 
     @PluginMethod
     public void getMediaToolsDiagnostics(PluginCall call) {
-        Context ctx = getContext();
         JSObject ret = new JSObject();
-        ret.put("bundledFfmpeg", NativeBinaryResolver.resolveBundledFfmpeg(ctx) != null);
-        ret.put("ffmpegWorks", MediaTools.hasWorkingFfmpeg(ctx));
-        ret.put("ytdlpInTermux", MediaTools.isYtdlpInstalledInTermux());
-        ret.put("ytdlpDirectExec", MediaTools.resolveYtdlp(ctx) != null);
-        ret.put("termuxPackage", TermuxDetector.findInstalledPackage(ctx));
-        ret.put("termuxVersion", TermuxDetector.getTermuxVersionName(ctx));
-        ret.put("termuxVersionCode", TermuxDetector.getTermuxVersionCode(ctx));
-        ret.put("termuxGooglePlayBuild", TermuxDetector.isGooglePlayBuild(ctx));
-        ret.put("termuxVersionSupported", TermuxDetector.isTermuxVersionLikelySupported(ctx));
-        ret.put("termuxInstalled", TermuxCommandRunner.isTermuxInstalled(ctx));
-        ret.put("termuxRunCommandDefined", TermuxDetector.isRunCommandPermissionDefined(ctx));
-        ret.put("termuxRunCommandPermission", TermuxCommandRunner.hasRunCommandPermission(ctx));
-        ret.put("termuxPermissionState", getPermissionState("termuxRun").toString());
-        ret.put("termuxSetupHint", TermuxCommandRunner.getSetupHint(ctx));
-        if (TermuxDetector.isRunCommandPermissionDefined(ctx)) {
-            ret.put("adbGrantCommand",
-                "adb shell pm grant " + ctx.getPackageName() + " com.termux.permission.RUN_COMMAND");
-        } else {
-            ret.put("adbGrantCommand", "(この端末では Unknown permission — 公式 Termux/F-Droid が必要)");
-        }
+        ret.put("mediaServerPort", MEDIA_SERVER_PORT);
+        ret.put("vmLibraryRoot", DEFAULT_VM_LIBRARY_ROOT);
+        ret.put("androidLibraryRoot", getLibraryRoot().getAbsolutePath());
+        ret.put("setupHint", "Debian Terminal で ./scripts/setup-debian-media-server.sh を実行し、ポート 8765 を転送してください");
         call.resolve(ret);
-    }
-
-    @PluginMethod
-    public void requestTermuxRunPermission(PluginCall call) {
-        Context ctx = getContext();
-        if (!TermuxCommandRunner.isTermuxInstalled(ctx)) {
-            call.reject("Termux がインストールされていません");
-            return;
-        }
-        if (TermuxCommandRunner.hasRunCommandPermission(ctx)) {
-            JSObject ret = new JSObject();
-            ret.put("granted", true);
-            call.resolve(ret);
-            return;
-        }
-        if (getPermissionState("termuxRun") == PermissionState.GRANTED) {
-            JSObject ret = new JSObject();
-            ret.put("granted", true);
-            call.resolve(ret);
-            return;
-        }
-        requestPermissionForAlias("termuxRun", call, "termuxRunPermsCallback");
-    }
-
-    @PermissionCallback
-    private void termuxRunPermsCallback(PluginCall call) {
-        boolean granted = TermuxCommandRunner.hasRunCommandPermission(getContext());
-        JSObject ret = new JSObject();
-        ret.put("granted", granted);
-        ret.put("permissionState", getPermissionState("termuxRun").toString());
-        if (!granted) {
-            ret.put("hint", TermuxCommandRunner.getSetupHint(getContext()));
-            ret.put("adbGrantCommand",
-                "adb shell pm grant " + getContext().getPackageName() + " com.termux.permission.RUN_COMMAND");
-        }
-        call.resolve(ret);
-    }
-
-    @PluginMethod
-    public void openAppPermissionSettings(PluginCall call) {
-        try {
-            Intent intent = new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
-            intent.setData(Uri.parse("package:" + getContext().getPackageName()));
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            getContext().startActivity(intent);
-            call.resolve();
-        } catch (Exception e) {
-            call.reject(e.getMessage());
-        }
     }
 
     @PluginMethod
@@ -914,83 +826,6 @@ public class MediaAudioFinderPlugin extends Plugin {
             call.resolve(ret);
         } catch (Exception e) {
             call.reject(e.getMessage());
-        }
-    }
-
-    @PluginMethod
-    public void downloadAudio(PluginCall call) {
-        try {
-            String url = call.getString("url", "");
-            String saveDir = call.getString("saveDir", getLibraryRoot().getAbsolutePath());
-            String audioFormat = call.getString("audioFormat", "auto");
-            if (url.isEmpty()) {
-                call.reject("URLが不正です");
-                return;
-            }
-            File dir = new File(saveDir);
-            dir.mkdirs();
-            String ytdlp = MediaTools.resolveYtdlp(getContext());
-            if (ytdlp == null) {
-                call.reject("yt-dlp が見つかりません。Termux で pkg install yt-dlp ffmpeg を実行してください");
-                return;
-            }
-            List<String> command = new ArrayList<>();
-            command.add(ytdlp);
-            command.add("-x");
-            command.add("--audio-format");
-            command.add("auto".equals(audioFormat) ? "mp3" : audioFormat);
-            command.add("-o");
-            command.add(new File(dir, "%(title).100s.%(ext)s").getAbsolutePath());
-            command.add("--no-playlist");
-            command.add(url);
-            runCommand(command, 900);
-            JSObject ret = new JSObject();
-            ret.put("ok", true);
-            call.resolve(ret);
-        } catch (Exception e) {
-            call.reject("ダウンロードに失敗しました: " + e.getMessage());
-        }
-    }
-
-    @PluginMethod
-    public void searchVideos(PluginCall call) {
-        try {
-            String query = call.getString("query", "").trim();
-            if (query.isEmpty()) {
-                call.reject("検索キーワードを入力してください");
-                return;
-            }
-            String ytdlp = MediaTools.resolveYtdlp(getContext());
-            if (ytdlp == null) {
-                call.reject("yt-dlp が見つかりません。Termux で pkg install yt-dlp ffmpeg を実行してください");
-                return;
-            }
-            List<String> command = new ArrayList<>();
-            command.add(ytdlp);
-            command.add("--flat-playlist");
-            command.add("-J");
-            command.add("ytsearch10:" + query);
-            String output = runCommand(command, 120);
-            JSONObject parsed = new JSONObject(output);
-            JSONArray entries = parsed.optJSONArray("entries");
-            JSArray results = new JSArray();
-            if (entries != null) {
-                for (int i = 0; i < entries.length(); i++) {
-                    JSONObject entry = entries.getJSONObject(i);
-                    JSObject item = new JSObject();
-                    item.put("title", entry.optString("title", "(No title)"));
-                    item.put("uploader", entry.optString("uploader", "-"));
-                    item.put("duration", entry.optString("duration_string", "-"));
-                    item.put("webpageUrl", entry.optString("webpage_url", entry.optString("url", "")));
-                    item.put("site", "youtube");
-                    results.put(item);
-                }
-            }
-            JSObject ret = new JSObject();
-            ret.put("results", results);
-            call.resolve(ret);
-        } catch (Exception e) {
-            call.reject("検索に失敗しました: " + e.getMessage());
         }
     }
 

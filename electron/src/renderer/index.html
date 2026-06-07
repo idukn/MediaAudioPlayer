@@ -2,17 +2,20 @@
 <html lang="ja">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>Media Audio Finder</title>
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
     <div class="app">
       <main>
-        <div class="tabs">
-          <button class="tab-btn active" data-tab="search">🔍 Search</button>
-          <button class="tab-btn" data-tab="files">🎵 Files</button>
-          <button class="tab-btn" data-tab="playlist">📚 Playlist</button>
+        <div class="tabs-scroll">
+          <div class="tabs">
+            <button class="tab-btn active" data-tab="search">🔍 Search</button>
+            <button class="tab-btn" data-tab="files">🎵 Files</button>
+            <button class="tab-btn" data-tab="playlist">📚 Playlist</button>
+            <button class="tab-btn" data-tab="preferences">⚙️ Preferences</button>
+          </div>
         </div>
 
         <section class="tab-content active" data-tab="search">
@@ -141,67 +144,69 @@
             </div>
           </div>
         </section>
-      </main>
 
-      <section class="panel">
-        <div class="row library-path-row">
-          <label for="libraryPath">ライブラリ</label>
-          <input id="libraryPath" type="text" readonly title="プレイリスト・ダウンロード・再生はこのフォルダのみ" />
-          <button id="openLibraryBtn" type="button">フォルダを開く</button>
-        </div>
-        <p class="library-path-hint">音源とプレイリストはローカルのライブラリに保存されます。外部フォルダのファイルを再生する場合は、ここにコピーしてください。</p>
-        <div class="row" style="margin-top: 10px;">
-          <button id="clearCacheBtn" class="danger-btn" style="background-color: #522; color: #f88; border: 1px solid #844; padding: 4px 8px; border-radius: 4px; cursor: pointer;">検索履歴・キャッシュをクリア</button>
-          <span id="cacheStatus" style="font-size: 12px; margin-left: 10px; color: #4ade80;"></span>
-        </div>
-        <div class="sync-panel">
-          <div class="sync-panel-title">P2P 同期 (Syncthing)</div>
-          <p class="sync-panel-desc">ライブラリ内の音源とプレイリストを、他のPCと自動同期します。両方の端末でお互いのデバイス ID を登録してください。</p>
-          <p class="sync-panel-desc" style="opacity:0.85;font-size:0.9em;">※ Mac のブラウザで <code>localhost:8384</code> を開いても Android 端末の Syncthing には届きません。設定はこの画面から行ってください。</p>
-          <div class="row sync-device-row">
-            <label for="syncMyDeviceId">この端末の ID</label>
-            <input id="syncMyDeviceId" type="text" readonly />
-            <button id="syncCopyDeviceIdBtn" type="button">コピー</button>
-          </div>
-          <div id="syncFolderStatus" class="sync-status-line">同期フォルダ: 準備中...</div>
-          <div class="row sync-device-row">
-            <label for="syncRemoteDeviceId">相手のデバイス ID</label>
-            <input id="syncRemoteDeviceId" type="text" placeholder="XXXXXXX-XXXXXXX-..." />
-            <button id="syncAddDeviceBtn" type="button">接続</button>
-          </div>
-          <div id="syncConnectStatus" class="sync-status-line"></div>
-          <ul id="syncDeviceList" class="sync-device-list"></ul>
-        </div>
-      </section>
-
-      <section class="panel player-dock">
-        <div class="player-info" style="display: flex; justify-content: space-between; align-items: flex-end;">
-          <div>
-            <div class="player-label">Now Playing</div>
-            <div id="nowPlayingText" class="now-playing-text">-</div>
-          </div>
-          <div id="playerTime" class="player-time" style="font-size: 12px; color: var(--muted); margin-bottom: 6px;">0:00 / 0:00</div>
-        </div>
-        <div class="player-controls" style="display: flex; align-items: center; gap: 10px;">
-          <button id="playerPlayPauseBtn" style="min-width: 40px; height: 40px; border-radius: 50%; padding: 0; display: flex; align-items: center; justify-content: center; font-size: 16px;">▶</button>
-          <button id="playerRepeatBtn" class="player-repeat-btn" aria-pressed="false" title="リピート再生: OFF">🔁</button>
-          <div class="player-progress-container" id="playerProgressContainer" style="flex: 1; height: 24px; display: flex; align-items: center; cursor: pointer; position: relative;">
-            <div class="player-progress-bg" style="width: 100%; height: 6px; background: rgba(255,255,255,0.1); border-radius: 3px; position: absolute;"></div>
-            <div class="player-progress-buffered" id="playerProgressBarBuffered" style="width: 0%; height: 6px; background: rgba(255,255,255,0.3); border-radius: 3px; position: absolute; transition: width 0.2s linear;"></div>
-            <div class="player-progress-fill" id="playerProgressBar" style="width: 0%; height: 6px; background: var(--accent); border-radius: 3px; position: absolute; pointer-events: none; transition: width 0.1s linear;">
-              <div style="position: absolute; right: -6px; top: -3px; width: 12px; height: 12px; background: #fff; border-radius: 50%; box-shadow: 0 0 4px rgba(0,0,0,0.5);"></div>
+        <section class="tab-content" data-tab="preferences">
+          <div class="panel preferences-panel">
+            <h2>Preferences</h2>
+            <div class="row library-path-row">
+              <label for="libraryPath">ライブラリ</label>
+              <input id="libraryPath" class="text-ellipsis" type="text" readonly title="プレイリスト・ダウンロード・再生はこのフォルダのみ" />
+              <button id="openLibraryBtn" type="button">フォルダを開く</button>
+            </div>
+            <p class="library-path-hint">音源とプレイリストはローカルのライブラリに保存されます。外部フォルダのファイルを再生する場合は、ここにコピーしてください。</p>
+            <div class="row preferences-actions">
+              <button id="clearCacheBtn" class="danger-btn">検索履歴・キャッシュをクリア</button>
+              <span id="cacheStatus" class="cache-status"></span>
+            </div>
+            <div class="sync-panel">
+              <div class="sync-panel-title">P2P 同期 (Syncthing)</div>
+              <p class="sync-panel-desc">ライブラリ内の音源とプレイリストを、他のPCと自動同期します。両方の端末でお互いのデバイス ID を登録してください。</p>
+              <p class="sync-panel-desc sync-panel-desc-note">※ Mac のブラウザで <code>localhost:8384</code> を開いても Android 端末の Syncthing には届きません。設定はこの画面から行ってください。</p>
+              <div class="row sync-device-row">
+                <label for="syncMyDeviceId">この端末の ID</label>
+                <input id="syncMyDeviceId" class="text-ellipsis" type="text" readonly />
+                <button id="syncCopyDeviceIdBtn" type="button">コピー</button>
+              </div>
+              <div id="syncFolderStatus" class="sync-status-line text-ellipsis">同期フォルダ: 準備中...</div>
+              <div class="row sync-device-row">
+                <label for="syncRemoteDeviceId">相手のデバイス ID</label>
+                <input id="syncRemoteDeviceId" class="text-ellipsis" type="text" placeholder="XXXXXXX-XXXXXXX-..." />
+                <button id="syncAddDeviceBtn" type="button">接続</button>
+              </div>
+              <div id="syncConnectStatus" class="sync-status-line text-ellipsis"></div>
+              <ul id="syncDeviceList" class="sync-device-list"></ul>
             </div>
           </div>
-          <div class="player-volume" title="Volume">
-            <button id="playerVolumeBtn" class="player-volume-btn" aria-label="Toggle mute">🔊</button>
-            <input id="playerVolumeBar" class="player-volume-bar" type="range" min="0" max="100" step="1" value="100" aria-label="Volume" />
-            <span id="playerVolumeValue" class="player-volume-value">100%</span>
+        </section>
+      </main>
+    </div>
+
+    <section class="panel player-dock">
+      <div class="player-info">
+        <div class="player-info-main">
+          <div class="player-label">Now Playing</div>
+          <div id="nowPlayingText" class="now-playing-text">-</div>
+        </div>
+        <div id="playerTime" class="player-time">0:00 / 0:00</div>
+      </div>
+      <div class="player-controls">
+        <button id="playerPlayPauseBtn">▶</button>
+        <button id="playerRepeatBtn" class="player-repeat-btn" aria-pressed="false" title="リピート再生: OFF">🔁</button>
+        <div class="player-progress-container" id="playerProgressContainer">
+          <div class="player-progress-bg"></div>
+          <div class="player-progress-buffered" id="playerProgressBarBuffered"></div>
+          <div class="player-progress-fill" id="playerProgressBar">
+            <div class="player-progress-thumb"></div>
           </div>
         </div>
-        <audio id="audioPlayer" style="display: none;"></audio>
-      </section>
-
-    </div>
+        <div class="player-volume" title="Volume">
+          <button id="playerVolumeBtn" class="player-volume-btn" aria-label="Toggle mute">🔊</button>
+          <input id="playerVolumeBar" class="player-volume-bar" type="range" min="0" max="100" step="1" value="100" aria-label="Volume" />
+          <span id="playerVolumeValue" class="player-volume-value">100%</span>
+        </div>
+      </div>
+      <audio id="audioPlayer" style="display: none;"></audio>
+    </section>
 
     <div id="playlistItemContextMenu" class="context-menu" style="display: none;">
       <button id="ctxRemoveFromPlaylist" class="context-menu-item">プレイリストから削除</button>

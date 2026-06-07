@@ -516,13 +516,20 @@ function buildAudioUrl(fullPath) {
   return `http://127.0.0.1:${audioServerPort}/audio?path=${encodeURIComponent(fullPath)}&t=${Date.now()}`;
 }
 
+async function resolveAudioUrl(fullPath) {
+  if (typeof window.api.buildLocalAudioUrlAsync === 'function') {
+    return window.api.buildLocalAudioUrlAsync(fullPath);
+  }
+  return buildAudioUrl(fullPath);
+}
+
 function formatPlaybackError(error) {
   if (!error) {
     return '不明なエラー';
   }
   const raw = error.message || String(error);
-  if (raw.includes('Invidious') || raw.includes('Piped') || raw.includes('公開 API')) {
-    return `${raw}\n\n再インストール後も同じ場合: ネットワーク/VPN、年齢制限付き動画、または F-Droid 版 Termux + RUN_COMMAND 許可を試してください。`;
+  if (raw.includes('Debian') || raw.includes('メディアサーバー') || raw.includes('8765')) {
+    return `${raw}\n\nDebian Terminal で ./scripts/setup-debian-media-server.sh を実行し、ポート 8765 の転送を許可してください。`;
   }
   if (error instanceof DOMException) {
     const code = audioPlayer?.error?.code;
@@ -589,13 +596,53 @@ function waitForAudioCanPlay(timeoutMs = 30000) {
   });
 }
 
-async function playAudioFromUrl(url) {
+async function playAudioFromUrl(url, { timeoutMs = 30000 } = {}) {
   prepareAudioPlayerForPlayback();
   audioPlayer.pause();
   audioPlayer.src = url;
   audioPlayer.load();
-  await waitForAudioCanPlay(30000);
+  await waitForAudioCanPlay(timeoutMs);
   await audioPlayer.play();
+}
+
+function isStreamPlaybackUrl(url) {
+  const src = String(url || '');
+  return src.includes('/stream?url=') || src.includes('/stream/prepare');
+}
+
+async function playYoutubePreviewStream(webpageUrl, { statusPrefix = '▶️ 再生中', title = 'Preview' } = {}) {
+  const maxAttempts = 2;
+  let lastError = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      await ensureAudioServerReady();
+      if (attempt === 1) {
+        setStatus('⏳ YouTube 音声を準備中（初回は数十秒かかることがあります）…');
+      } else {
+        setStatus(`⏳ 再試行中 (${attempt}/${maxAttempts})…`);
+      }
+      let previewUrl;
+      if (typeof window.api.getPreviewStreamUrl === 'function') {
+        previewUrl = await window.api.getPreviewStreamUrl({ url: webpageUrl });
+        if (previewUrl && typeof previewUrl === 'object' && previewUrl.streamUrl) {
+          previewUrl = previewUrl.streamUrl;
+        }
+      } else {
+        previewUrl = `http://127.0.0.1:${audioServerPort}/stream?url=${encodeURIComponent(webpageUrl)}`;
+      }
+      await playAudioFromUrl(previewUrl, { timeoutMs: 90000 });
+      setNowPlayingText(title);
+      setStatus(`${statusPrefix}: ${title}`);
+      return;
+    } catch (error) {
+      lastError = error;
+      console.warn(`[Audio] YouTube stream attempt ${attempt} failed:`, error);
+      if (attempt < maxAttempts) {
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
+    }
+  }
+  throw lastError || new Error('YouTube 試聴に失敗しました');
 }
 
 function cloneSearchItemForState(item) {
@@ -630,6 +677,129 @@ function getSearchSnapshotForState() {
       .map((item) => cloneSearchItemForState(item))
       .filter((item) => !!item),
   };
+}
+
+function clonePlaybackQueueItemForState(item) {
+  const normalized = normalizePlaylistItem(item);
+  if (!normalized) {
+    return null;
+  }
+  if (normalized.fullPath || normalized.type === 'local') {
+    return {
+      type: 'local',
+      title: normalized.title || '(No title)',
+      uploader: normalized.uploader || 'Local File',
+      duration: normalized.duration || '-',
+      durationSec: Number.isFinite(normalized.durationSec) ? Number(normalized.durationSec) : null,
+      fullPath: toStorageLibraryPath(normalized.fullPath) || normalized.fullPath,
+    };
+  }
+  const urlItem = cloneSearchItemForState(normalized);
+  if (!urlItem) {
+    return null;
+  }
+  return {
+    type: 'url',
+    ...urlItem,
+  };
+}
+
+function getPlaybackSnapshotForState() {
+  if (!Array.isArray(currentPlaybackQueue) || currentPlaybackQueue.length === 0) {
+    return null;
+  }
+  const queue = currentPlaybackQueue
+    .map((item) => clonePlaybackQueueItemForState(item))
+    .filter((item) => !!item);
+  if (queue.length === 0) {
+    return null;
+  }
+  const hasActivePlayback = Boolean(audioPlayer?.src) || currentPlaybackIndex >= 0;
+  return {
+    queue,
+    index: currentPlaybackIndex,
+    sourceType: currentPlaybackSourceType,
+    currentTime: Number.isFinite(audioPlayer?.currentTime) ? audioPlayer.currentTime : 0,
+    wasPlaying: hasActivePlayback && audioPlayer && !audioPlayer.paused,
+  };
+}
+
+async function resolvePlaybackQueueItemFromState(raw) {
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+  if (raw.type === 'local' || raw.fullPath) {
+    const resolvedPath = await resolveLocalPlaybackPath(raw);
+    if (!resolvedPath) {
+      return null;
+    }
+    return toPlaylistItemFromLocalPath(resolvedPath);
+  }
+  if (raw.webpageUrl) {
+    return normalizePlaylistItem(raw);
+  }
+  return null;
+}
+
+async function restorePlaybackFromState(snapshot) {
+  if (!snapshot || !Array.isArray(snapshot.queue) || snapshot.queue.length === 0) {
+    return;
+  }
+
+  const queue = [];
+  for (const raw of snapshot.queue) {
+    const item = await resolvePlaybackQueueItemFromState(raw);
+    if (item) {
+      queue.push(item);
+    }
+  }
+  if (queue.length === 0) {
+    return;
+  }
+
+  const savedIndex = Number(snapshot.index);
+  const index = Number.isFinite(savedIndex)
+    ? Math.max(0, Math.min(Math.floor(savedIndex), queue.length - 1))
+    : 0;
+  setPlaybackQueue(queue, index, String(snapshot.sourceType || ''));
+
+  const current = getCurrentPlaybackQueueItem();
+  if (!current) {
+    return;
+  }
+  setNowPlayingText(current.title || '-');
+
+  if (!snapshot.wasPlaying) {
+    return;
+  }
+
+  try {
+    const resumeAt = Number(snapshot.currentTime);
+    await playCurrentPlaybackQueueItem({ statusPrefix: '▶️ 再生再開' });
+    if (Number.isFinite(resumeAt) && resumeAt > 0) {
+      const applySeek = () => {
+        if (Number.isFinite(audioPlayer.duration) && resumeAt <= audioPlayer.duration) {
+          audioPlayer.currentTime = resumeAt;
+        }
+      };
+      if (audioPlayer.readyState >= HTMLMediaElement.HAVE_METADATA) {
+        applySeek();
+      } else {
+        audioPlayer.addEventListener('loadedmetadata', applySeek, { once: true });
+      }
+    }
+  } catch (error) {
+    console.warn('[Boot] Failed to resume playback:', error);
+    setStatus('前回の再生を再開できませんでした');
+  }
+}
+
+function flushPersistedUiState() {
+  if (typeof window.api.flushUIState === 'function') {
+    void window.api.flushUIState();
+    return;
+  }
+  persistUiState();
 }
 
 function restoreSearchSnapshotFromState(snapshot) {
@@ -1033,8 +1203,9 @@ async function playPlaybackQueueItem(item, { statusPrefix = '▶️ 再生中' }
       resolvedPath,
       originalPath: normalized.fullPath,
     });
-    await ensureAudioServerReady();
-    await playAudioFromUrl(buildAudioUrl(resolvedPath));
+    const audioUrl = await resolveAudioUrl(resolvedPath);
+    console.log('[Audio] Local URL:', audioUrl);
+    await playAudioFromUrl(audioUrl, { timeoutMs: 45000 });
     setNowPlayingText(normalized.title || 'Local Audio');
     setStatus(`${statusPrefix}: ${normalized.title || 'Local Audio'}`);
     return;
@@ -1042,19 +1213,10 @@ async function playPlaybackQueueItem(item, { statusPrefix = '▶️ 再生中' }
 
   selectedLocalIndex = -1;
   if (normalized.webpageUrl) {
-    await ensureAudioServerReady();
-    setStatus('⏳ YouTube 音声を準備中（初回は数十秒〜数分）…');
-    let previewUrl;
-    if (typeof window.api.preparePreviewStream === 'function') {
-      previewUrl = await window.api.preparePreviewStream({ url: normalized.webpageUrl });
-    } else if (typeof window.api.getPreviewStreamUrl === 'function') {
-      previewUrl = await window.api.getPreviewStreamUrl({ url: normalized.webpageUrl });
-    } else {
-      previewUrl = `http://127.0.0.1:${audioServerPort}/stream?url=${encodeURIComponent(normalized.webpageUrl)}`;
-    }
-    await playAudioFromUrl(previewUrl);
-    setNowPlayingText(normalized.title || 'Preview');
-    setStatus(`${statusPrefix}: ${normalized.title || 'Preview'}`);
+    await playYoutubePreviewStream(normalized.webpageUrl, {
+      statusPrefix,
+      title: normalized.title || 'Preview',
+    });
     return;
   }
 
@@ -1727,8 +1889,11 @@ function switchTab(tabName) {
   currentTabActive = tabName;
   document.querySelectorAll('.tab-btn').forEach((btn) => btn.classList.remove('active'));
   document.querySelectorAll('.tab-content').forEach((content) => content.classList.remove('active'));
-  document.querySelector(`[data-tab="${tabName}"].tab-btn`).classList.add('active');
-  document.querySelector(`[data-tab="${tabName}"].tab-content`).classList.add('active');
+  const tabBtn = document.querySelector(`[data-tab="${tabName}"].tab-btn`);
+  const tabContent = document.querySelector(`[data-tab="${tabName}"].tab-content`);
+  tabBtn?.classList.add('active');
+  tabContent?.classList.add('active');
+  tabBtn?.scrollIntoView({ inline: 'nearest', block: 'nearest', behavior: 'smooth' });
   persistUiState();
 }
 
@@ -1833,6 +1998,7 @@ function persistUiState() {
     saveAudioFormat: saveAudioFormatEl?.value || 'auto',
     playlistId: currentPlaylistId,
     searchSnapshot: getSearchSnapshotForState(),
+    playbackSnapshot: getPlaybackSnapshotForState(),
   });
 }
 
@@ -2351,6 +2517,9 @@ async function boot() {
   if (platformInfo && openLibraryBtn) {
     openLibraryBtn.textContent = `${platformInfo.fileManagerLabel || 'フォルダ'}で開く`;
   }
+  if (platformInfo?.platform === 'android') {
+    document.body.classList.add('platform-android');
+  }
   baseAudioDir = libraryDir;
   if (libraryPathEl) {
     libraryPathEl.value = libraryDir;
@@ -2375,7 +2544,7 @@ async function boot() {
     restoreSearchSnapshotFromState(savedState.searchSnapshot);
   }
 
-  if (!['search', 'files', 'playlist'].includes(currentTabActive)) {
+  if (!['search', 'files', 'playlist', 'preferences'].includes(currentTabActive)) {
     currentTabActive = 'search';
   }
   switchTab(currentTabActive);
@@ -2412,12 +2581,38 @@ async function boot() {
     renderPlaylists();
   }
 
+  if (savedState?.playbackSnapshot) {
+    await restorePlaybackFromState(savedState.playbackSnapshot);
+  }
+
   updateBackButtonVisibility();
 
   suppressStatePersist = false;
   persistUiState();
 
   bootCompleted = true;
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+      persistUiState();
+      flushPersistedUiState();
+    }
+  });
+
+  window.addEventListener('pagehide', () => {
+    persistUiState();
+    flushPersistedUiState();
+  });
+
+  const appPlugin = window.Capacitor?.Plugins?.App;
+  if (appPlugin?.addListener) {
+    appPlugin.addListener('appStateChange', ({ isActive }) => {
+      if (!isActive) {
+        persistUiState();
+        flushPersistedUiState();
+      }
+    });
+  }
 
   if (syncInfoRefreshTimer) {
     clearInterval(syncInfoRefreshTimer);
@@ -2448,8 +2643,8 @@ async function boot() {
     });
 
     const src = String(audioPlayer.src || '');
-    const isYoutubeStream = src.includes('/stream?url=') || src.includes('/stream/prepare');
-    const isLocalStream = src.includes('/audio?path=') || src.includes('_capacitor_file_');
+    const isYoutubeStream = isStreamPlaybackUrl(src) || currentQueueItem?.type === 'url';
+    const isLocalStream = src.includes('/audio?path=') || src.includes('_capacitor_file_') || src.includes(':8767/audio');
     const currentQueueItem = getCurrentPlaybackQueueItem();
 
     if (isYoutubeStream || currentQueueItem?.type === 'url') {
@@ -2457,9 +2652,9 @@ async function boot() {
       const youtubeUrl = currentQueueItem?.webpageUrl || '';
       alertWithYoutubeFallback(
         `試聴に失敗しました。\n\n理由: ${errorMessage}\n\n`
-          + '2026 年 5 月時点、公開 Piped/Invidious が YouTube ボット検出で停止しています。\n'
-          + '・YouTube アプリ/ブラウザで開いて再生してください。\n'
-          + '・F-Droid 版 Termux + yt-dlp + RUN_COMMAND 許可があれば一部再生可能です。',
+          + 'Debian VM 内の yt-dlp / ffmpeg パイプ（/stream）で再生します。\n'
+          + '・Terminal でメディアサーバーが起動しているか確認してください。\n'
+          + '・それでも失敗する場合は YouTube アプリ/ブラウザで開いてください。',
         youtubeUrl,
       );
       return;
@@ -2570,6 +2765,9 @@ async function boot() {
 
   audioPlayer.addEventListener('pause', () => {
     playerPlayPauseBtn.textContent = '▶';
+    if (bootCompleted) {
+      persistUiState();
+    }
   });
 
   audioPlayer.addEventListener('canplay', () => {
