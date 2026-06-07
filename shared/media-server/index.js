@@ -1,6 +1,7 @@
 'use strict';
 
 const express = require('express');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
@@ -217,8 +218,14 @@ const YTDLP_STREAM_ARGS = [
   '--user-agent', 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
 ];
 
-async function resolveDirectStreamUrl(ytdlp, pageUrl, workDir) {
-  const formats = ['ba/b', 'bestaudio/best'];
+async function resolveDirectStreamUrl(ytdlp, pageUrl, workDir, quality = 'medium') {
+  const qualityKey = normalizeStreamQuality(quality);
+  const formatGroups = {
+    low: ['worstaudio/worstaudio', 'worstaudio', 'ba/b'],
+    medium: ['ba/b', 'bestaudio/best'],
+    high: ['ba/b', 'bestaudio/best'],
+  };
+  const formats = formatGroups[qualityKey] || formatGroups.medium;
   for (const format of formats) {
     try {
       const { stdout } = await runCommand(ytdlp, [
@@ -232,7 +239,7 @@ async function resolveDirectStreamUrl(ytdlp, pageUrl, workDir) {
         .map((entry) => entry.trim())
         .find((entry) => entry.startsWith('http'));
       if (line) {
-        console.log(`[ProxyStream] Direct URL resolved via format=${format}`);
+        console.log(`[ProxyStream] Direct URL resolved via format=${format} quality=${qualityKey}`);
         return line;
       }
     } catch (err) {
@@ -242,14 +249,182 @@ async function resolveDirectStreamUrl(ytdlp, pageUrl, workDir) {
   return null;
 }
 
+function normalizeStreamQuality(raw) {
+  const value = String(raw || 'medium').toLowerCase();
+  if (value === 'low' || value === 'high') {
+    return value;
+  }
+  return 'medium';
+}
+
+async function resolveStreamTranscodeProfile(ffmpegPath, quality) {
+  const qualityKey = normalizeStreamQuality(quality);
+  const bitrate = qualityKey === 'low' ? '64k' : qualityKey === 'high' ? '192k' : '128k';
+  const base = await resolvePreviewTranscodeProfile(ffmpegPath);
+  if (base.id === 'mp3') {
+    return {
+      ...base,
+      ffmpegArgs: ['-c:a', 'libmp3lame', '-b:a', bitrate, '-id3v2_version', '0', '-write_xing', '0', '-f', 'mp3'],
+    };
+  }
+  if (base.id === 'aac-mp4') {
+    return {
+      ...base,
+      ffmpegArgs: ['-c:a', 'aac', '-b:a', bitrate, '-movflags', 'frag_keyframe+empty_moov+default_base_moof', '-f', 'mp4'],
+    };
+  }
+  return base;
+}
+
+const STREAM_CACHE_TTL_MS = 60 * 60 * 1000;
+const STREAM_CACHE_MIN_BYTES = 4096;
+
+function streamCacheExtension(profile) {
+  if (profile.id === 'mp3') {
+    return '.mp3';
+  }
+  if (profile.id === 'aac-mp4') {
+    return '.m4a';
+  }
+  return '.webm';
+}
+
+function streamCachePaths(cacheDir, pageUrl, quality, profile) {
+  const hash = crypto.createHash('sha256').update(`${pageUrl}\0${quality}\0${profile.id}`).digest('hex');
+  const ext = streamCacheExtension(profile);
+  const base = path.join(cacheDir, hash);
+  return {
+    cachePath: `${base}${ext}`,
+    partPath: `${base}${ext}.part`,
+  };
+}
+
+function isStreamCacheFresh(cachePath) {
+  try {
+    const stat = fs.statSync(cachePath);
+    if (stat.size < STREAM_CACHE_MIN_BYTES) {
+      return false;
+    }
+    return Date.now() - stat.mtimeMs < STREAM_CACHE_TTL_MS;
+  } catch {
+    return false;
+  }
+}
+
+function cleanupExpiredStreamCache(cacheDir) {
+  let entries = [];
+  try {
+    entries = fs.readdirSync(cacheDir);
+  } catch {
+    return;
+  }
+  const now = Date.now();
+  for (const name of entries) {
+    const fullPath = path.join(cacheDir, name);
+    try {
+      const stat = fs.statSync(fullPath);
+      if (now - stat.mtimeMs >= STREAM_CACHE_TTL_MS) {
+        fs.unlinkSync(fullPath);
+      }
+    } catch {
+      // ignore stale entries
+    }
+  }
+}
+
+function parseStreamStartSec(raw) {
+  const value = Number.parseFloat(String(raw ?? '0'));
+  if (!Number.isFinite(value) || value < 0) {
+    return 0;
+  }
+  return Math.min(value, 86400);
+}
+
+function serveCachedStreamFromTime(res, filePath, transcodeProfile, startSec, ffmpegPath) {
+  console.log(`[ProxyStream] Cached stream seek startSec=${startSec} path=${filePath}`);
+  res.setHeader('Content-Type', transcodeProfile.contentType);
+  res.setHeader('Transfer-Encoding', 'chunked');
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+
+  const ff = spawn(ffmpegPath, [
+    '-hide_banner',
+    '-loglevel', 'error',
+    '-accurate_seek',
+    '-ss', String(startSec),
+    '-i', filePath,
+    '-vn',
+    '-map_metadata', '-1',
+    ...transcodeProfile.ffmpegArgs,
+    '-y',
+    'pipe:1',
+  ]);
+
+  ff.stdout.pipe(res);
+  ff.stderr.on('data', (chunk) => {
+    const msg = chunk.toString().trim();
+    if (msg) {
+      console.error('[ProxyStream] cached seek ffmpeg stderr:', msg);
+    }
+  });
+  ff.on('error', (err) => {
+    console.error('[ProxyStream] cached seek ffmpeg error:', err.message);
+    if (!res.headersSent) {
+      res.status(500).send('Cached stream seek failed');
+    }
+  });
+  ff.on('close', (code) => {
+    if (code !== 0 && !res.headersSent) {
+      res.status(500).send('Cached stream seek failed');
+    }
+  });
+  res.on('close', () => {
+    if (!ff.killed) {
+      ff.kill('SIGKILL');
+    }
+  });
+}
+
+function serveCachedAudioFile(req, res, filePath, contentType) {
+  const stat = fs.statSync(filePath);
+  const fileSize = stat.size;
+  const range = req.headers.range;
+
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('Content-Type', contentType);
+  res.setHeader('Cache-Control', 'private, max-age=3600');
+
+  if (range) {
+    const match = /^bytes=(\d+)-(\d*)$/i.exec(String(range));
+    if (match) {
+      const start = Number.parseInt(match[1], 10);
+      const end = match[2] ? Number.parseInt(match[2], 10) : fileSize - 1;
+      if (Number.isFinite(start) && start < fileSize) {
+        const safeEnd = Math.min(end, fileSize - 1);
+        res.status(206);
+        res.setHeader('Content-Range', `bytes ${start}-${safeEnd}/${fileSize}`);
+        res.setHeader('Content-Length', String(safeEnd - start + 1));
+        fs.createReadStream(filePath, { start, end: safeEnd }).pipe(res);
+        return;
+      }
+    }
+  }
+
+  res.setHeader('Content-Length', String(fileSize));
+  fs.createReadStream(filePath).pipe(res);
+}
+
 function createMediaServer(options = {}) {
   const libraryRoot = path.resolve(options.libraryRoot || path.join(process.env.HOME || '/tmp', 'library'));
   const previewDir = path.resolve(options.previewDir || path.join(libraryRoot, '.preview-cache'));
   const streamWorkDir = path.resolve(options.streamWorkDir || path.join(libraryRoot, '.stream-work'));
+  const streamCacheDir = path.resolve(options.streamCacheDir || path.join(libraryRoot, '.stream-cache'));
 
   fs.mkdirSync(libraryRoot, { recursive: true });
   fs.mkdirSync(previewDir, { recursive: true });
   fs.mkdirSync(streamWorkDir, { recursive: true });
+  fs.mkdirSync(streamCacheDir, { recursive: true });
 
   const app = express();
   app.use(corsMiddleware);
@@ -274,6 +449,36 @@ function createMediaServer(options = {}) {
       });
     } catch (err) {
       res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  app.get('/api/metadata', async (req, res) => {
+    const pageUrl = req.query.url;
+    if (!pageUrl || typeof pageUrl !== 'string') {
+      return res.status(400).json({ ok: false, error: 'Missing url' });
+    }
+    try {
+      const ytdlp = await findExecutable('yt-dlp');
+      const { stdout } = await runCommand(ytdlp, [
+        '-j',
+        '--no-playlist',
+        '--no-warnings',
+        '--no-download',
+        ...YTDLP_EJS_ARGS,
+        pageUrl,
+      ], { timeout: 30000 });
+      const meta = JSON.parse(stdout);
+      const durationSec = Number.isFinite(meta.duration) && meta.duration > 0
+        ? Math.round(meta.duration)
+        : null;
+      res.json({
+        ok: true,
+        durationSec,
+        title: meta.title || '',
+        uploader: meta.uploader || meta.channel || '',
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message || String(err) });
     }
   });
 
@@ -358,12 +563,51 @@ function createMediaServer(options = {}) {
     if (!url || typeof url !== 'string') {
       return res.status(400).send('Missing url');
     }
+    const streamQuality = normalizeStreamQuality(req.query.quality);
+    const startSec = parseStreamStartSec(req.query.start);
+
+    cleanupExpiredStreamCache(streamCacheDir);
 
     let yt = null;
     let ff = null;
     let isEnded = false;
     let responseStarted = false;
     let startupTimer = null;
+    let cacheStream = null;
+    let cacheBytes = 0;
+    let cacheFinalized = false;
+    let cachePaths = null;
+    let transcodeProfile = null;
+
+    const finalizeCache = (success) => {
+      if (cacheFinalized || !cacheStream || !cachePaths) {
+        return;
+      }
+      cacheFinalized = true;
+      const { cachePath, partPath } = cachePaths;
+      cacheStream.end(() => {
+        if (success && cacheBytes >= STREAM_CACHE_MIN_BYTES) {
+          try {
+            fs.renameSync(partPath, cachePath);
+            fs.utimesSync(cachePath, new Date(), new Date());
+            console.log(`[ProxyStream] Cache saved (${cacheBytes} bytes): ${cachePath}`);
+          } catch (err) {
+            console.error('[ProxyStream] Cache save failed:', err.message);
+            try {
+              fs.unlinkSync(partPath);
+            } catch {
+              // ignore
+            }
+          }
+          return;
+        }
+        try {
+          fs.unlinkSync(partPath);
+        } catch {
+          // ignore
+        }
+      });
+    };
 
     const cleanup = (reason) => {
       if (isEnded) {
@@ -381,6 +625,16 @@ function createMediaServer(options = {}) {
       if (ff && !ff.killed) {
         ff.kill('SIGKILL');
       }
+      if (!cacheFinalized && cachePaths) {
+        try {
+          if (cacheStream) {
+            cacheStream.destroy();
+          }
+          fs.unlinkSync(cachePaths.partPath);
+        } catch {
+          // ignore partial cache
+        }
+      }
     };
 
     try {
@@ -391,10 +645,37 @@ function createMediaServer(options = {}) {
         return res.status(500).send('Dependencies missing');
       }
 
-      const transcodeProfile = await resolvePreviewTranscodeProfile(ffmpeg);
+      transcodeProfile = await resolveStreamTranscodeProfile(ffmpeg, streamQuality);
+      cachePaths = streamCachePaths(streamCacheDir, url, streamQuality, transcodeProfile);
 
-      const directUrl = await resolveDirectStreamUrl(ytdlp, url, streamWorkDir);
-      const useDirectUrl = Boolean(directUrl);
+      if (isStreamCacheFresh(cachePaths.cachePath)) {
+        if (startSec > 0) {
+          console.log(`[ProxyStream] Serving cached stream from ${startSec}s: ${cachePaths.cachePath}`);
+          return serveCachedStreamFromTime(
+            res,
+            cachePaths.cachePath,
+            transcodeProfile,
+            startSec,
+            ffmpeg,
+          );
+        }
+        console.log(`[ProxyStream] Serving cached stream: ${cachePaths.cachePath}`);
+        return serveCachedAudioFile(req, res, cachePaths.cachePath, transcodeProfile.contentType);
+      }
+
+      try {
+        fs.unlinkSync(cachePaths.partPath);
+      } catch {
+        // ignore stale partial
+      }
+      cacheStream = fs.createWriteStream(cachePaths.partPath);
+
+      const directUrl = await resolveDirectStreamUrl(ytdlp, url, streamWorkDir, streamQuality);
+      // Direct ffmpeg URL piping cannot reliably seek; yt-dlp sections are accurate for YouTube.
+      const useDirectUrl = Boolean(directUrl) && startSec <= 0;
+      if (startSec > 0) {
+        console.log(`[ProxyStream] Seek ${startSec}s via yt-dlp sections`);
+      }
 
       const beginResponse = () => {
         if (responseStarted || isEnded) {
@@ -422,28 +703,43 @@ function createMediaServer(options = {}) {
       }, useDirectUrl ? 45000 : 25000);
 
       if (useDirectUrl) {
-        ff = spawn(ffmpeg, [
+        if (startSec > 0) {
+          console.log(`[ProxyStream] Live stream output seek from ${startSec}s`);
+        }
+        const ffArgs = [
           '-hide_banner',
           '-loglevel', 'error',
           '-reconnect', '1',
           '-reconnect_streamed', '1',
           '-reconnect_delay_max', '5',
           '-fflags', '+nobuffer',
-          '-i', directUrl,
+        ];
+        // Remote URLs often ignore input-side -ss; output-side seek is slower but accurate.
+        if (startSec > 0) {
+          ffArgs.push('-i', directUrl, '-ss', String(startSec));
+        } else {
+          ffArgs.push('-i', directUrl);
+        }
+        ffArgs.push(
           '-vn',
           '-map_metadata', '-1',
           ...transcodeProfile.ffmpegArgs,
           '-y',
           'pipe:1',
-        ], { cwd: streamWorkDir });
+        );
+        ff = spawn(ffmpeg, ffArgs, { cwd: streamWorkDir });
       } else {
         console.log('[ProxyStream] Falling back to yt-dlp stdout pipe');
-        yt = spawn(ytdlp, [
+        const ytdlpArgs = [
           '-o', '-',
           '-f', 'ba/b',
           ...YTDLP_STREAM_ARGS,
-          url,
-        ], { cwd: streamWorkDir });
+        ];
+        if (startSec > 0) {
+          ytdlpArgs.push('--download-sections', `*${Math.floor(startSec)}-`);
+        }
+        ytdlpArgs.push(url);
+        yt = spawn(ytdlp, ytdlpArgs, { cwd: streamWorkDir });
 
         ff = spawn(ffmpeg, [
           '-hide_banner',
@@ -501,6 +797,10 @@ function createMediaServer(options = {}) {
       ff.stdout.on('data', (chunk) => {
         beginResponse();
         res.write(chunk);
+        if (cacheStream && !cacheFinalized) {
+          cacheStream.write(chunk);
+          cacheBytes += chunk.length;
+        }
       });
 
       ff.on('close', (code) => {
@@ -512,6 +812,7 @@ function createMediaServer(options = {}) {
           return;
         }
         if (!isEnded) {
+          finalizeCache(responseStarted && code === 0);
           res.end();
           cleanup(`ffmpeg close code=${code}`);
         }
@@ -691,7 +992,7 @@ function createMediaServer(options = {}) {
     }
   });
 
-  return { app, libraryRoot, previewDir, streamWorkDir };
+  return { app, libraryRoot, previewDir, streamWorkDir, streamCacheDir };
 }
 
 function startMediaServer(options = {}) {

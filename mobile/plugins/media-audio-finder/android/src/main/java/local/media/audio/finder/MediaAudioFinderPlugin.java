@@ -2,7 +2,10 @@ package local.media.audio.finder;
 
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.Manifest;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Environment;
 import android.os.FileObserver;
 import android.os.Handler;
@@ -14,6 +17,9 @@ import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
+
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -32,6 +38,47 @@ import java.util.Set;
 
 @CapacitorPlugin(name = "MediaAudioFinder")
 public class MediaAudioFinderPlugin extends Plugin {
+
+    private static final int REQUEST_POST_NOTIFICATIONS = 87652;
+
+    private void ensureNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            return;
+        }
+        if (getActivity() == null) {
+            return;
+        }
+        if (ContextCompat.checkSelfPermission(getContext(), Manifest.permission.POST_NOTIFICATIONS)
+            == PackageManager.PERMISSION_GRANTED) {
+            return;
+        }
+        ActivityCompat.requestPermissions(
+            getActivity(),
+            new String[] { Manifest.permission.POST_NOTIFICATIONS },
+            REQUEST_POST_NOTIFICATIONS
+        );
+    }
+
+    @PluginMethod
+    public void ensureNotificationPermission(PluginCall call) {
+        ensureNotificationPermissionIfNeeded();
+        call.resolve();
+    }
+
+    @Override
+    protected void handleRequestPermissionsResult(
+        int requestCode,
+        String[] permissions,
+        int[] grantResults
+    ) {
+        super.handleRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode != REQUEST_POST_NOTIFICATIONS) {
+            return;
+        }
+        if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            NativePlaybackManager.getInstance(getContext()).refreshNotificationIfActive();
+        }
+    }
 
     static final int MEDIA_SERVER_PORT = 8765;
     static final String DEFAULT_VM_LIBRARY_ROOT =
@@ -71,6 +118,21 @@ public class MediaAudioFinderPlugin extends Plugin {
         syncthingManager = new SyncthingManager(getContext());
         syncthingManager.bootstrap(getLibraryRoot().getAbsolutePath(), this::emitSyncUpdated);
         setupLibraryWatcher();
+        NativePlaybackManager.getInstance(getContext()).attachPlugin(this, new NativePlaybackManager.LibraryPathResolver() {
+            @Override
+            public String resolveLibraryAudioPath(String rawPath) {
+                return MediaAudioFinderPlugin.this.resolveLibraryAudioPath(rawPath);
+            }
+
+            @Override
+            public File getLibraryRoot() {
+                return MediaAudioFinderPlugin.this.getLibraryRoot();
+            }
+        });
+    }
+
+    void notifyPlaybackEvent(String event, JSObject payload) {
+        notifyListeners(event, payload);
     }
 
     @Override
@@ -944,5 +1006,110 @@ public class MediaAudioFinderPlugin extends Plugin {
                 call.reject(e.getMessage());
             }
         }, "syncthing-add-device").start();
+    }
+
+    @PluginMethod
+    public void configureNativePlayback(PluginCall call) {
+        try {
+            JSONArray jsonItems = new JSONArray();
+            com.getcapacitor.JSArray jsItems = call.getArray("items");
+            if (jsItems != null) {
+                jsonItems = new JSONArray(jsItems.toString());
+            }
+            int index = call.getInt("index", 0);
+            String loopMode = call.getString("loopMode", "off");
+            NativePlaybackManager.getInstance(getContext()).configureQueue(jsonItems, index, loopMode);
+            call.resolve();
+        } catch (Exception e) {
+            call.reject(e.getMessage());
+        }
+    }
+
+    @PluginMethod
+    public void playNativePlayback(PluginCall call) {
+        ensureNotificationPermissionIfNeeded();
+        NativePlaybackManager manager = NativePlaybackManager.getInstance(getContext());
+        int index = call.getInt("index", -1);
+        long positionMs = readLongOption(call, "positionMs", 0L);
+        PlaybackLog.info("plugin playNativePlayback", PlaybackLog.put(
+            PlaybackLog.with("index", index), "positionMs", positionMs));
+        if (index >= 0) {
+            manager.playAtIndex(index, positionMs);
+        } else {
+            manager.playAtCurrentIndex();
+        }
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void pauseNativePlayback(PluginCall call) {
+        NativePlaybackManager.getInstance(getContext()).playPause();
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void skipNativePlaybackNext(PluginCall call) {
+        NativePlaybackManager.getInstance(getContext()).skipNext();
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void skipNativePlaybackPrevious(PluginCall call) {
+        NativePlaybackManager.getInstance(getContext()).skipPrevious();
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void setNativePlaybackLoopMode(PluginCall call) {
+        NativePlaybackManager.getInstance(getContext()).setLoopMode(call.getString("loopMode", "off"));
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void cycleNativePlaybackLoopMode(PluginCall call) {
+        NativePlaybackManager.getInstance(getContext()).cycleLoopMode();
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void stopNativePlayback(PluginCall call) {
+        NativePlaybackManager.getInstance(getContext()).stopPlayback();
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void seekNativePlayback(PluginCall call) {
+        long positionMs = readLongOption(call, "positionMs", 0L);
+        PlaybackLog.info("plugin seekNativePlayback", PlaybackLog.with("positionMs", positionMs));
+        NativePlaybackManager.getInstance(getContext()).seekTo(positionMs);
+        call.resolve();
+    }
+
+    private static long readLongOption(PluginCall call, String key, long defaultValue) {
+        if (call.getData() == null || !call.getData().has(key)) {
+            return defaultValue;
+        }
+        try {
+            Double value = call.getDouble(key);
+            if (value != null && Double.isFinite(value)) {
+                return Math.max(0L, value.longValue());
+            }
+        } catch (Exception ignored) {
+            // fall through
+        }
+        try {
+            Integer value = call.getInt(key);
+            if (value != null) {
+                return Math.max(0L, value.longValue());
+            }
+        } catch (Exception ignored) {
+            // fall through
+        }
+        return defaultValue;
+    }
+
+    @PluginMethod
+    public void getNativePlaybackState(PluginCall call) {
+        NativePlaybackManager.getInstance(getContext()).deliverPlaybackState(call::resolve);
     }
 }

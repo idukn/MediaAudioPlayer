@@ -62,8 +62,11 @@ const tableBody = document.querySelector('#resultsTable tbody');
 const audioListEl = document.getElementById('audioList');
 const audioPlayer = document.getElementById('audioPlayer');
 const nowPlayingTextEl = document.getElementById('nowPlayingText');
+const nowPlayingLoadingEl = document.getElementById('nowPlayingLoading');
 
 const playerPlayPauseBtn = document.getElementById('playerPlayPauseBtn');
+const playerPrevBtn = document.getElementById('playerPrevBtn');
+const playerNextBtn = document.getElementById('playerNextBtn');
 const playerProgressContainer = document.getElementById('playerProgressContainer');
 const playerProgressBar = document.getElementById('playerProgressBar');
 const playerProgressBarBuffered = document.getElementById('playerProgressBarBuffered');
@@ -116,6 +119,22 @@ let syncInfoFastPollTimer = null;
 let bootCompleted = false;
 let isBackgroundEnriching = false;
 let suppressStatePersist = false;
+let streamPlaybackQuality = 'medium';
+let nativePlaybackActive = false;
+let nativePlaybackPlayerDurationMs = 0;
+let nativePlaybackHintDurationMs = 0;
+let nativePlaybackPollTimer = null;
+let lastNativePlaybackIndex = -1;
+let lastNativePlaybackPositionMs = 0;
+let lastNativePlayingState = false;
+let streamQualityAdaptInFlight = false;
+let streamStableHighBufferChecks = 0;
+let lastStreamQualityChangeMs = 0;
+const STREAM_QUALITY_CHANGE_COOLDOWN_MS = 8000;
+const STABLE_CHECKS_FOR_UPGRADE = 2;
+let detachNativePlaybackTrackListener = null;
+let detachNativePlaybackStateListener = null;
+let detachNativePlaybackLoopListener = null;
 let playlists = [];
 let currentPlaylistId = '';
 let pendingPlaylistPickerResolver = null;
@@ -509,6 +528,21 @@ function setNowPlayingText(text) {
   nowPlayingTextEl.textContent = text && text.trim().length > 0 ? text : '-';
 }
 
+function setNowPlayingLoading(isLoading) {
+  if (!nowPlayingLoadingEl) {
+    return;
+  }
+  nowPlayingLoadingEl.hidden = !isLoading;
+}
+
+function playbackLog(event, data = {}) {
+  try {
+    console.log(`[Playback] ${event} ${JSON.stringify(data)}`);
+  } catch {
+    console.log(`[Playback] ${event}`, data);
+  }
+}
+
 function buildAudioUrl(fullPath) {
   if (typeof window.api.buildLocalAudioUrl === 'function') {
     return window.api.buildLocalAudioUrl(fullPath);
@@ -597,12 +631,515 @@ function waitForAudioCanPlay(timeoutMs = 30000) {
 }
 
 async function playAudioFromUrl(url, { timeoutMs = 30000 } = {}) {
+  if (isNativeAndroidPlayback()) {
+    setNowPlayingLoading(true);
+    await syncNativePlaybackQueueToNative();
+    await prefetchCurrentTrackDurationIfNeeded();
+    await syncNativePlaybackQueueToNative();
+    const idx = currentPlaybackIndex >= 0 ? currentPlaybackIndex : 0;
+    await window.api.playNativePlayback({ index: idx });
+    nativePlaybackActive = true;
+    playerPlayPauseBtn.textContent = '⏸';
+    return;
+  }
   prepareAudioPlayerForPlayback();
   audioPlayer.pause();
   audioPlayer.src = url;
   audioPlayer.load();
+  nativePlaybackActive = false;
   await waitForAudioCanPlay(timeoutMs);
   await audioPlayer.play();
+}
+
+function isNativeAndroidPlayback() {
+  return window.Capacitor?.getPlatform?.() === 'android'
+    && typeof window.api?.configureNativePlayback === 'function';
+}
+
+function resolveKnownDurationSec(item) {
+  const normalized = normalizePlaylistItem(item);
+  if (!normalized) {
+    return NaN;
+  }
+  if (Number.isFinite(normalized.durationSec) && normalized.durationSec > 0) {
+    return Number(normalized.durationSec);
+  }
+  const parsed = parseDurationInputToSec(normalized.duration, -1);
+  return parsed > 0 ? parsed : NaN;
+}
+
+function getKnownDurationSecForCurrentTrack() {
+  return resolveKnownDurationSec(getCurrentPlaybackQueueItem());
+}
+
+async function prefetchCurrentTrackDurationIfNeeded() {
+  const item = getCurrentPlaybackQueueItem();
+  const normalized = normalizePlaylistItem(item);
+  if (!normalized?.webpageUrl) {
+    return;
+  }
+  const knownSec = resolveKnownDurationSec(normalized);
+  if (Number.isFinite(knownSec) && knownSec > 0) {
+    return;
+  }
+  try {
+    if (typeof window.api?.ensureMediaServerReady === 'function') {
+      await window.api.ensureMediaServerReady();
+    }
+    const cfg = typeof window.api?.getMediaServerConfig === 'function'
+      ? await window.api.getMediaServerConfig()
+      : { port: 8765 };
+    const port = Number(cfg?.port) || 8765;
+    const response = await fetch(
+      `http://127.0.0.1:${port}/api/metadata?url=${encodeURIComponent(normalized.webpageUrl)}`,
+    );
+    const data = await response.json();
+    const durationSec = Number(data?.durationSec);
+    if (!data?.ok || !Number.isFinite(durationSec) || durationSec <= 0) {
+      return;
+    }
+    const idx = currentPlaybackIndex;
+    if (idx < 0 || idx >= currentPlaybackQueue.length) {
+      return;
+    }
+    currentPlaybackQueue[idx] = {
+      ...currentPlaybackQueue[idx],
+      durationSec,
+      duration: formatSecToDurationInput(durationSec),
+    };
+  } catch (error) {
+    console.warn('[Playback] duration prefetch failed:', error);
+  }
+}
+
+function buildNativePlaybackItems() {
+  return currentPlaybackQueue
+    .map((item) => {
+      const normalized = normalizePlaylistItem(item);
+      if (!normalized) {
+        return null;
+      }
+      const durationSec = resolveKnownDurationSec(normalized);
+      const base = {
+        title: normalized.title || '(No title)',
+        duration: normalized.duration || '-',
+      };
+      const durationFields = Number.isFinite(durationSec) && durationSec > 0
+        ? { durationSec: Math.round(durationSec) }
+        : {};
+      if (normalized.fullPath || normalized.type === 'local') {
+        return {
+          type: 'local',
+          fullPath: toStorageLibraryPath(normalized.fullPath) || normalized.fullPath,
+          artist: normalized.uploader || 'Local File',
+          ...base,
+          ...durationFields,
+        };
+      }
+      if (normalized.webpageUrl) {
+        return {
+          type: 'stream',
+          webpageUrl: normalized.webpageUrl,
+          artist: normalized.uploader || 'YouTube',
+          ...base,
+          ...durationFields,
+        };
+      }
+      return null;
+    })
+    .filter((item) => !!item);
+}
+
+async function syncNativePlaybackQueueToNative() {
+  if (!isNativeAndroidPlayback()) {
+    return;
+  }
+  const items = buildNativePlaybackItems();
+  if (items.length === 0) {
+    return;
+  }
+  const index = currentPlaybackIndex >= 0
+    ? Math.min(currentPlaybackIndex, items.length - 1)
+    : 0;
+  await window.api.configureNativePlayback({
+    items,
+    index,
+    loopMode: playerLoopMode,
+  });
+}
+
+function getEffectiveNativeDurationMs() {
+  if (nativePlaybackHintDurationMs > 0) {
+    if (nativePlaybackPlayerDurationMs <= 0
+        || nativePlaybackPlayerDurationMs < nativePlaybackHintDurationMs - 3000) {
+      return nativePlaybackHintDurationMs;
+    }
+  }
+  return nativePlaybackPlayerDurationMs > 0
+    ? nativePlaybackPlayerDurationMs
+    : nativePlaybackHintDurationMs;
+}
+
+function updatePlayerProgressUI(positionSec, durationSec) {
+  if (!playerProgressContainer || !playerProgressBar) {
+    return;
+  }
+  const pos = Number(positionSec);
+  const dur = Number(durationSec);
+  if (!Number.isFinite(pos) || pos < 0) {
+    return;
+  }
+  if (Number.isFinite(dur) && dur > 0) {
+    const percent = Math.min(100, Math.max(0, (pos / dur) * 100));
+    playerProgressContainer.style.setProperty('--progress-pct', String(percent));
+    playerTime.textContent = `${formatSecToDurationInput(pos)} / ${formatSecToDurationInput(dur)}`;
+    return;
+  }
+  playerProgressContainer.style.setProperty('--progress-pct', '0');
+  playerTime.textContent = `${formatSecToDurationInput(pos)} / --:--`;
+}
+
+function resetNativePlaybackProgressUi(options = {}) {
+  const knownDur = Number.isFinite(options.durationSec) && options.durationSec > 0
+    ? Number(options.durationSec)
+    : getKnownDurationSecForCurrentTrack();
+  nativePlaybackPlayerDurationMs = 0;
+  nativePlaybackHintDurationMs = Number.isFinite(knownDur) && knownDur > 0 ? knownDur * 1000 : 0;
+  playerProgressContainer?.style.setProperty('--progress-pct', '0');
+  if (playerProgressBarBuffered) {
+    playerProgressBarBuffered.style.width = '0%';
+  }
+  if (Number.isFinite(knownDur) && knownDur > 0) {
+    updatePlayerProgressUI(0, knownDur);
+    return;
+  }
+  if (playerTime) {
+    playerTime.textContent = '0:00 / --:--';
+  }
+}
+
+function applyNativePlaybackState(event) {
+  if (!event || typeof event !== 'object') {
+    return;
+  }
+  if (Number.isFinite(event.index) && event.index !== lastNativePlaybackIndex) {
+    lastNativePlaybackIndex = event.index;
+    resetNativePlaybackProgressUi();
+  }
+  if (Number.isFinite(event.index)) {
+    currentPlaybackIndex = event.index;
+  }
+  if (typeof event.playing === 'boolean') {
+    lastNativePlayingState = event.playing;
+    playerPlayPauseBtn.textContent = event.playing ? '⏸' : '▶';
+  }
+  if (event.error === true) {
+    nativePlaybackActive = false;
+    setNowPlayingLoading(false);
+    if (typeof event.errorMessage === 'string' && event.errorMessage) {
+      setStatus(event.errorMessage);
+    } else {
+      setStatus('再生できません: メディアサーバーに接続できません');
+    }
+    return;
+  }
+  if (event.playing === true || event.buffering === true) {
+    nativePlaybackActive = true;
+  }
+  if (event.playing && event.buffering !== true) {
+    setNowPlayingLoading(false);
+  }
+  if (event.buffering === true) {
+    setNowPlayingLoading(true);
+  } else if (event.buffering === false && event.playing === true) {
+    setNowPlayingLoading(false);
+  } else if (event.buffering === false && event.playing === false) {
+    setNowPlayingLoading(false);
+  }
+  const positionMs = Number(event.positionMs);
+  const durationMs = Number(event.durationMs);
+  const hintDurationMs = Number(event.hintDurationMs);
+  const durationSec = Number(event.durationSec);
+  if (Number.isFinite(durationMs) && durationMs > 0) {
+    const hintMs = Number.isFinite(hintDurationMs) && hintDurationMs > 0
+      ? hintDurationMs
+      : nativePlaybackHintDurationMs;
+    if (hintMs <= 0 || durationMs >= hintMs - 3000) {
+      nativePlaybackPlayerDurationMs = durationMs;
+    }
+  }
+  if (Number.isFinite(hintDurationMs) && hintDurationMs > 0) {
+    nativePlaybackHintDurationMs = hintDurationMs;
+  } else if (Number.isFinite(durationSec) && durationSec > 0 && nativePlaybackPlayerDurationMs <= 0) {
+    nativePlaybackHintDurationMs = durationSec * 1000;
+  } else if (nativePlaybackHintDurationMs <= 0 && nativePlaybackPlayerDurationMs <= 0) {
+    const knownDur = getKnownDurationSecForCurrentTrack();
+    if (Number.isFinite(knownDur) && knownDur > 0) {
+      nativePlaybackHintDurationMs = knownDur * 1000;
+    }
+  }
+  if (Number.isFinite(positionMs)) {
+    lastNativePlaybackPositionMs = positionMs;
+    const effectiveDurationMs = getEffectiveNativeDurationMs();
+    updatePlayerProgressUI(
+      positionMs / 1000,
+      effectiveDurationMs > 0 ? effectiveDurationMs / 1000 : NaN,
+    );
+  }
+}
+
+function getProgressSeekRatio(event, container) {
+  if (!container) {
+    return null;
+  }
+  const rect = container.getBoundingClientRect();
+  if (rect.width <= 0) {
+    return null;
+  }
+  const touch = event.changedTouches?.[0] || event.touches?.[0];
+  let clientX = touch?.clientX;
+  if (!Number.isFinite(clientX)) {
+    clientX = event.clientX;
+  }
+  if (!Number.isFinite(clientX) && Number.isFinite(event.pageX)) {
+    clientX = event.pageX - (window.scrollX || 0);
+  }
+  if (!Number.isFinite(clientX) && event.currentTarget === container && Number.isFinite(event.offsetX)) {
+    return Math.max(0, Math.min(1, event.offsetX / rect.width));
+  }
+  if (!Number.isFinite(clientX)) {
+    return null;
+  }
+  return Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+}
+
+async function seekNativePlaybackFromProgressEvent(event) {
+  if (!isNativeAndroidPlayback() || !nativePlaybackActive) {
+    return false;
+  }
+  const ratio = getProgressSeekRatio(event, playerProgressContainer);
+  if (ratio == null) {
+    return true;
+  }
+  let durationMs = nativePlaybackPlayerDurationMs;
+  if (durationMs <= 0) {
+    durationMs = nativePlaybackHintDurationMs;
+  }
+  if (!Number.isFinite(durationMs) || durationMs <= 0) {
+    if (typeof window.api?.getNativePlaybackState === 'function') {
+      try {
+        const state = await window.api.getNativePlaybackState();
+        applyNativePlaybackState(state);
+        durationMs = Number(state?.durationMs) > 0
+          ? Number(state.durationMs)
+          : nativePlaybackHintDurationMs;
+      } catch {
+        return true;
+      }
+    }
+  }
+  if (!Number.isFinite(durationMs) || durationMs <= 0) {
+    return true;
+  }
+  const positionMs = Math.round(ratio * durationMs);
+  playbackLog('seek request', {
+    ratio,
+    durationMs,
+    positionMs,
+    playerDurationMs: nativePlaybackPlayerDurationMs,
+    hintDurationMs: nativePlaybackHintDurationMs,
+  });
+  if (typeof window.api?.seekNativePlayback === 'function') {
+    setNowPlayingLoading(true);
+    void window.api.seekNativePlayback({ positionMs });
+  }
+  return true;
+}
+
+function startNativePlaybackPolling() {
+  if (!isNativeAndroidPlayback() || nativePlaybackPollTimer) {
+    return;
+  }
+  nativePlaybackPollTimer = setInterval(() => {
+    if (!nativePlaybackActive || typeof window.api?.getNativePlaybackState !== 'function') {
+      return;
+    }
+    void window.api.getNativePlaybackState().then(applyNativePlaybackState).catch(() => {});
+  }, 500);
+}
+
+function stopNativePlaybackPolling() {
+  if (nativePlaybackPollTimer) {
+    clearInterval(nativePlaybackPollTimer);
+    nativePlaybackPollTimer = null;
+  }
+}
+
+async function skipToPreviousTrack() {
+  if (isNativeAndroidPlayback() && nativePlaybackActive) {
+    await window.api.skipNativePlaybackPrevious();
+    return;
+  }
+  const queueLength = currentPlaybackQueue.length;
+  if (queueLength === 0 || currentPlaybackIndex < 0) {
+    return;
+  }
+  if ((audioPlayer.currentTime || 0) > 3) {
+    audioPlayer.currentTime = 0;
+    return;
+  }
+  if (currentPlaybackIndex > 0) {
+    currentPlaybackIndex -= 1;
+  } else {
+    currentPlaybackIndex = queueLength - 1;
+  }
+  await playCurrentPlaybackQueueItem({ statusPrefix: '▶️ 再生中' });
+}
+
+async function skipToNextTrack() {
+  if (isNativeAndroidPlayback() && nativePlaybackActive) {
+    await window.api.skipNativePlaybackNext();
+    return;
+  }
+  const queueLength = currentPlaybackQueue.length;
+  if (queueLength === 0 || currentPlaybackIndex < 0) {
+    return;
+  }
+  if (currentPlaybackIndex < queueLength - 1) {
+    currentPlaybackIndex += 1;
+  } else {
+    currentPlaybackIndex = 0;
+  }
+  await playCurrentPlaybackQueueItem({ statusPrefix: '▶️ 再生中' });
+}
+
+function setupNativePlaybackListeners() {
+  if (!isNativeAndroidPlayback() || !window.api.onNativePlaybackTrackChanged) {
+    return;
+  }
+  if (detachNativePlaybackTrackListener) {
+    detachNativePlaybackTrackListener();
+  }
+  if (detachNativePlaybackStateListener) {
+    detachNativePlaybackStateListener();
+  }
+  if (detachNativePlaybackLoopListener) {
+    detachNativePlaybackLoopListener();
+  }
+  detachNativePlaybackTrackListener = window.api.onNativePlaybackTrackChanged((event) => {
+    playbackLog('track changed', {
+      index: event?.index,
+      title: event?.title,
+      streamQuality: event?.streamQuality,
+    });
+    if (Number.isFinite(event?.index)) {
+      if (event.index !== lastNativePlaybackIndex) {
+        lastNativePlaybackIndex = event.index;
+        const eventDurationSec = Number(event?.durationSec);
+        resetNativePlaybackProgressUi({
+          durationSec: Number.isFinite(eventDurationSec) && eventDurationSec > 0
+            ? eventDurationSec
+            : getKnownDurationSecForCurrentTrack(),
+        });
+      }
+      currentPlaybackIndex = event.index;
+    }
+    nativePlaybackActive = true;
+    setNowPlayingText(event?.title || '-');
+    if (event?.streamQuality) {
+      streamPlaybackQuality = event.streamQuality;
+    }
+    playerPlayPauseBtn.textContent = '⏸';
+    applyNativePlaybackState(event);
+    persistUiState();
+  });
+  detachNativePlaybackStateListener = window.api.onNativePlaybackStateChanged((event) => {
+    applyNativePlaybackState(event);
+  });
+  detachNativePlaybackLoopListener = window.api.onNativePlaybackLoopModeChanged((event) => {
+    if (event?.loopMode) {
+      setPlayerLoopMode(event.loopMode, { persist: true, syncNative: false });
+    }
+  });
+  startNativePlaybackPolling();
+}
+
+function getBufferedAheadSec() {
+  if (!audioPlayer?.buffered?.length) {
+    return 0;
+  }
+  const current = audioPlayer.currentTime || 0;
+  let end = 0;
+  for (let i = 0; i < audioPlayer.buffered.length; i += 1) {
+    end = Math.max(end, audioPlayer.buffered.end(i));
+  }
+  return Math.max(0, end - current);
+}
+
+async function reconnectStreamAtCurrentQuality(resumeAt) {
+  const item = getCurrentPlaybackQueueItem();
+  if (!item?.webpageUrl) {
+    return;
+  }
+  const previewUrl = await window.api.getPreviewStreamUrl({
+    url: item.webpageUrl,
+    quality: streamPlaybackQuality,
+  });
+  prepareAudioPlayerForPlayback();
+  audioPlayer.pause();
+  audioPlayer.src = previewUrl;
+  audioPlayer.load();
+  await waitForAudioCanPlay(90000);
+  await audioPlayer.play();
+  if (resumeAt > 0) {
+    audioPlayer.currentTime = resumeAt;
+  }
+}
+
+function canChangeStreamQualityNow() {
+  return Date.now() - lastStreamQualityChangeMs >= STREAM_QUALITY_CHANGE_COOLDOWN_MS;
+}
+
+async function maybeAdaptStreamQuality() {
+  if (streamQualityAdaptInFlight || isNativeAndroidPlayback() || !isStreamPlaybackUrl(audioPlayer.src)) {
+    return;
+  }
+  const ahead = getBufferedAheadSec();
+  if (ahead > 0 && ahead < 5 && streamPlaybackQuality !== 'low') {
+    streamQualityAdaptInFlight = true;
+    streamStableHighBufferChecks = 0;
+    try {
+      streamPlaybackQuality = streamPlaybackQuality === 'high' ? 'medium' : 'low';
+      lastStreamQualityChangeMs = Date.now();
+      const resumeAt = audioPlayer.currentTime || 0;
+      await reconnectStreamAtCurrentQuality(resumeAt);
+    } catch (error) {
+      console.warn('[Audio] stream quality downgrade failed:', error);
+    } finally {
+      streamQualityAdaptInFlight = false;
+    }
+    return;
+  }
+  if (ahead > 15 && streamPlaybackQuality !== 'high') {
+    streamStableHighBufferChecks += 1;
+    if (streamStableHighBufferChecks < STABLE_CHECKS_FOR_UPGRADE || !canChangeStreamQualityNow()) {
+      return;
+    }
+    streamQualityAdaptInFlight = true;
+    streamStableHighBufferChecks = 0;
+    try {
+      streamPlaybackQuality = streamPlaybackQuality === 'low' ? 'medium' : 'high';
+      lastStreamQualityChangeMs = Date.now();
+      const resumeAt = audioPlayer.currentTime || 0;
+      await reconnectStreamAtCurrentQuality(resumeAt);
+    } catch (error) {
+      console.warn('[Audio] stream quality upgrade failed:', error);
+    } finally {
+      streamQualityAdaptInFlight = false;
+    }
+    return;
+  }
+  streamStableHighBufferChecks = 0;
 }
 
 function isStreamPlaybackUrl(url) {
@@ -611,6 +1148,16 @@ function isStreamPlaybackUrl(url) {
 }
 
 async function playYoutubePreviewStream(webpageUrl, { statusPrefix = '▶️ 再生中', title = 'Preview' } = {}) {
+  if (isNativeAndroidPlayback()) {
+    await syncNativePlaybackQueueToNative();
+    const idx = currentPlaybackIndex >= 0 ? currentPlaybackIndex : 0;
+    await window.api.playNativePlayback({ index: idx });
+    nativePlaybackActive = true;
+    setNowPlayingText(title);
+    setStatus(`${statusPrefix}: ${title}`);
+    playerPlayPauseBtn.textContent = '⏸';
+    return;
+  }
   const maxAttempts = 2;
   let lastError = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -623,12 +1170,15 @@ async function playYoutubePreviewStream(webpageUrl, { statusPrefix = '▶️ 再
       }
       let previewUrl;
       if (typeof window.api.getPreviewStreamUrl === 'function') {
-        previewUrl = await window.api.getPreviewStreamUrl({ url: webpageUrl });
+        previewUrl = await window.api.getPreviewStreamUrl({
+          url: webpageUrl,
+          quality: streamPlaybackQuality,
+        });
         if (previewUrl && typeof previewUrl === 'object' && previewUrl.streamUrl) {
           previewUrl = previewUrl.streamUrl;
         }
       } else {
-        previewUrl = `http://127.0.0.1:${audioServerPort}/stream?url=${encodeURIComponent(webpageUrl)}`;
+        previewUrl = `http://127.0.0.1:${audioServerPort}/stream?url=${encodeURIComponent(webpageUrl)}&quality=${encodeURIComponent(streamPlaybackQuality)}`;
       }
       await playAudioFromUrl(previewUrl, { timeoutMs: 90000 });
       setNowPlayingText(title);
@@ -714,13 +1264,18 @@ function getPlaybackSnapshotForState() {
   if (queue.length === 0) {
     return null;
   }
-  const hasActivePlayback = Boolean(audioPlayer?.src) || currentPlaybackIndex >= 0;
+  const wasPlayingNative = isNativeAndroidPlayback()
+    && nativePlaybackActive
+    && lastNativePlayingState;
+  const wasPlayingHtml = Boolean(audioPlayer?.src) && audioPlayer && !audioPlayer.paused;
   return {
     queue,
     index: currentPlaybackIndex,
     sourceType: currentPlaybackSourceType,
-    currentTime: Number.isFinite(audioPlayer?.currentTime) ? audioPlayer.currentTime : 0,
-    wasPlaying: hasActivePlayback && audioPlayer && !audioPlayer.paused,
+    currentTime: wasPlayingNative && lastNativePlaybackPositionMs > 0
+      ? lastNativePlaybackPositionMs / 1000
+      : (Number.isFinite(audioPlayer?.currentTime) ? audioPlayer.currentTime : 0),
+    wasPlaying: wasPlayingNative || wasPlayingHtml,
   };
 }
 
@@ -739,6 +1294,25 @@ async function resolvePlaybackQueueItemFromState(raw) {
     return normalizePlaylistItem(raw);
   }
   return null;
+}
+
+async function waitForMediaServerReadyWithRetry(maxAttempts = 30, delayMs = 500) {
+  if (typeof window.api?.ensureMediaServerReady !== 'function') {
+    throw new Error('メディアサーバー API が利用できません');
+  }
+  let lastError = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      await window.api.ensureMediaServerReady();
+      return;
+    } catch (error) {
+      lastError = error;
+      if (attempt < maxAttempts - 1) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+  }
+  throw lastError || new Error('メディアサーバーに接続できません');
 }
 
 async function restorePlaybackFromState(snapshot) {
@@ -775,6 +1349,15 @@ async function restorePlaybackFromState(snapshot) {
 
   try {
     const resumeAt = Number(snapshot.currentTime);
+    playbackLog('restore playback', { index, wasPlaying: snapshot.wasPlaying, resumeAt });
+    if (isNativeAndroidPlayback()) {
+      await syncNativePlaybackQueueToNative();
+      if (snapshot.wasPlaying) {
+        const positionMs = Number.isFinite(resumeAt) && resumeAt > 0 ? Math.floor(resumeAt * 1000) : 0;
+        await startNativePlaybackFromQueue(positionMs);
+      }
+      return;
+    }
     await playCurrentPlaybackQueueItem({ statusPrefix: '▶️ 再生再開' });
     if (Number.isFinite(resumeAt) && resumeAt > 0) {
       const applySeek = () => {
@@ -1176,6 +1759,60 @@ function buildLocalPlaybackQueue() {
     .map((file) => toPlaylistItemFromLocalPath(file.fullPath));
 }
 
+async function startNativePlaybackFromQueue(positionMs = 0) {
+  if (!isNativeAndroidPlayback() || currentPlaybackIndex < 0 || currentPlaybackQueue.length === 0) {
+    return false;
+  }
+  const needsMediaServer = currentPlaybackQueue.some((item) => item?.webpageUrl);
+  if (needsMediaServer) {
+    setNowPlayingLoading(true);
+    setStatus('⏳ メディアサーバー起動を待っています…');
+    await waitForMediaServerReadyWithRetry(40, 500);
+    await prefetchCurrentTrackDurationIfNeeded();
+  }
+  await syncNativePlaybackQueueToNative();
+  resetNativePlaybackProgressUi({
+    durationSec: getKnownDurationSecForCurrentTrack(),
+  });
+  playbackLog('native play start', { index: currentPlaybackIndex, positionMs });
+  await window.api.playNativePlayback({
+    index: currentPlaybackIndex,
+    positionMs: Math.max(0, Math.floor(positionMs)),
+  });
+  setNowPlayingLoading(true);
+  return true;
+}
+
+async function togglePlaybackPlayPause() {
+  if (isNativeAndroidPlayback()) {
+    if (nativePlaybackActive) {
+      try {
+        await window.api.pauseNativePlayback();
+        const state = await window.api.getNativePlaybackState();
+        applyNativePlaybackState(state);
+        return;
+      } catch (error) {
+        console.warn('[Playback] native toggle failed:', error);
+      }
+    }
+    if (currentPlaybackIndex >= 0 && currentPlaybackQueue.length > 0) {
+      try {
+        await startNativePlaybackFromQueue(lastNativePlaybackPositionMs);
+        return;
+      } catch (error) {
+        console.warn('[Playback] native play failed:', error);
+        setStatus(`再生できません: ${error.message}`);
+        return;
+      }
+    }
+  }
+  if (audioPlayer.paused) {
+    await audioPlayer.play();
+  } else {
+    audioPlayer.pause();
+  }
+}
+
 async function playPlaybackQueueItem(item, { statusPrefix = '▶️ 再生中' } = {}) {
   const normalized = normalizePlaylistItem(item);
   if (!normalized) {
@@ -1186,7 +1823,7 @@ async function playPlaybackQueueItem(item, { statusPrefix = '▶️ 再生中' }
   currentAudioDurationSec = Number.isFinite(normalized.durationSec)
     ? Number(normalized.durationSec)
     : parseDurationInputToSec(normalized.duration, 0);
-  playerProgressBar.style.width = '0%';
+  playerProgressContainer?.style.setProperty('--progress-pct', '0');
   playerProgressBarBuffered.style.width = '0%';
   playerTime.textContent = `0:00 / ${formatSecToDurationInput(currentAudioDurationSec)}`;
 
@@ -1239,9 +1876,12 @@ async function playCurrentPlaybackQueueItem(options = {}) {
 }
 
 async function handleEndedPlayback() {
+  if (isNativeAndroidPlayback() && nativePlaybackActive) {
+    return;
+  }
   const mode = normalizeLoopMode(playerLoopMode);
   const queueLength = currentPlaybackQueue.length;
-  if (mode === 'off' || queueLength === 0 || currentPlaybackIndex < 0) {
+  if (queueLength === 0 || currentPlaybackIndex < 0) {
     return;
   }
 
@@ -1257,6 +1897,12 @@ async function handleEndedPlayback() {
         currentPlaybackIndex = 0;
       }
       await playCurrentPlaybackQueueItem({ statusPrefix: '▶️ ループ再生中' });
+      return;
+    }
+
+    if (currentPlaybackIndex < queueLength - 1) {
+      currentPlaybackIndex += 1;
+      await playCurrentPlaybackQueueItem({ statusPrefix: '▶️ 再生中' });
     }
   } catch (error) {
     console.error('[Audio] ended loop playback failed:', error);
@@ -1960,11 +2606,14 @@ function updateRepeatUi() {
   playerRepeatBtn.title = `ループ: ${getLoopModeDisplayText(mode)}`;
 }
 
-function setPlayerLoopMode(mode, { persist = true } = {}) {
+function setPlayerLoopMode(mode, { persist = true, syncNative = true } = {}) {
   playerLoopMode = normalizeLoopMode(mode);
   // Looping behavior is handled by the ended event to support playlist loops.
   audioPlayer.loop = false;
   updateRepeatUi();
+  if (syncNative && isNativeAndroidPlayback()) {
+    void window.api.setNativePlaybackLoopMode({ loopMode: playerLoopMode });
+  }
   if (persist) {
     persistUiState();
   }
@@ -2519,6 +3168,13 @@ async function boot() {
   }
   if (platformInfo?.platform === 'android') {
     document.body.classList.add('platform-android');
+    if (typeof window.api.ensureNotificationPermission === 'function') {
+      try {
+        await window.api.ensureNotificationPermission();
+      } catch (error) {
+        console.warn('[Boot] notification permission request failed:', error);
+      }
+    }
   }
   baseAudioDir = libraryDir;
   if (libraryPathEl) {
@@ -2582,7 +3238,17 @@ async function boot() {
   }
 
   if (savedState?.playbackSnapshot) {
+    setupNativePlaybackListeners();
     await restorePlaybackFromState(savedState.playbackSnapshot);
+    if (isNativeAndroidPlayback() && nativePlaybackActive && typeof window.api?.getNativePlaybackState === 'function') {
+      try {
+        applyNativePlaybackState(await window.api.getNativePlaybackState());
+      } catch {
+        // ignore
+      }
+    }
+  } else {
+    setupNativePlaybackListeners();
   }
 
   updateBackButtonVisibility();
@@ -2684,19 +3350,14 @@ async function boot() {
   });
 
   audioPlayer.addEventListener('timeupdate', () => {
+    if (isNativeAndroidPlayback() && nativePlaybackActive) {
+      return;
+    }
     const duration = (isFinite(audioPlayer.duration) && audioPlayer.duration > 0)
                        ? audioPlayer.duration
                        : currentAudioDurationSec;
     const current = audioPlayer.currentTime || 0;
-    
-    if (duration > 0) {
-      const percent = Math.min(100, (current / duration) * 100);
-      playerProgressBar.style.width = `${percent}%`;
-      playerTime.textContent = `${formatSecToDurationInput(current)} / ${formatSecToDurationInput(duration)}`;
-    } else {
-      playerProgressBar.style.width = '0%';
-      playerTime.textContent = `${formatSecToDurationInput(current)} / 0:00`;
-    }
+    updatePlayerProgressUI(current, duration > 0 ? duration : NaN);
   });
 
   audioPlayer.addEventListener('progress', () => {
@@ -2710,27 +3371,47 @@ async function boot() {
     } else {
       playerProgressBarBuffered.style.width = '0%';
     }
+    void maybeAdaptStreamQuality();
   });
 
   playerPlayPauseBtn.addEventListener('click', () => {
-    if (audioPlayer.paused) {
-      audioPlayer.play();
-    } else {
-      audioPlayer.pause();
-    }
+    void togglePlaybackPlayPause();
   });
 
+  if (playerPrevBtn) {
+    playerPrevBtn.addEventListener('click', () => {
+      void skipToPreviousTrack();
+    });
+  }
+
+  if (playerNextBtn) {
+    playerNextBtn.addEventListener('click', () => {
+      void skipToNextTrack();
+    });
+  }
+
   playerProgressContainer.addEventListener('click', (e) => {
-    const duration = (isFinite(audioPlayer.duration) && audioPlayer.duration > 0)
-                       ? audioPlayer.duration
-                       : currentAudioDurationSec;
-    if (duration > 0) {
-      const rect = playerProgressContainer.getBoundingClientRect();
-      const clickX = e.clientX - rect.left;
-      const percent = Math.max(0, Math.min(1, clickX / rect.width));
-      audioPlayer.currentTime = percent * duration;
-    }
+    void (async () => {
+      if (await seekNativePlaybackFromProgressEvent(e)) {
+        return;
+      }
+      const duration = (isFinite(audioPlayer.duration) && audioPlayer.duration > 0)
+                         ? audioPlayer.duration
+                         : currentAudioDurationSec;
+      const ratio = getProgressSeekRatio(e, playerProgressContainer);
+      if (duration > 0 && ratio != null) {
+        audioPlayer.currentTime = ratio * duration;
+      }
+    })();
   });
+
+  playerProgressContainer.addEventListener('touchend', (e) => {
+    if (!isNativeAndroidPlayback() || !nativePlaybackActive) {
+      return;
+    }
+    e.preventDefault();
+    void seekNativePlaybackFromProgressEvent(e);
+  }, { passive: false });
 
   if (playerVolumeBar) {
     playerVolumeBar.addEventListener('input', (e) => {
@@ -2774,7 +3455,12 @@ async function boot() {
     console.log('[Audio] canplay - ready to play');
   });
 
+  audioPlayer.addEventListener('waiting', () => {
+    setNowPlayingLoading(true);
+  });
+
   audioPlayer.addEventListener('playing', () => {
+    setNowPlayingLoading(false);
     const file = localFiles[selectedLocalIndex];
     if (file) {
       console.log('[Audio] playing:', file.name);

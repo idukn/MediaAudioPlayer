@@ -186,6 +186,7 @@
     },
     getPlatformInfo: () => nativeCall('getPlatformInfo'),
     getMediaServerConfig: () => getMediaServerConfig(),
+    ensureMediaServerReady: () => ensureMediaServerReady(),
     getMediaToolsDiagnostics: async () => {
       try {
         const cfg = await getMediaServerConfig();
@@ -232,7 +233,8 @@
       if (!url) {
         throw new Error('試聴を開始できませんでした');
       }
-      return `${mediaServerBaseUrl(cfg.port)}/stream?url=${encodeURIComponent(url)}`;
+      const quality = payload?.quality || 'medium';
+      return `${mediaServerBaseUrl(cfg.port)}/stream?url=${encodeURIComponent(url)}&quality=${encodeURIComponent(quality)}`;
     },
     downloadAudio: async (payload) => {
       await ensureMediaServerReady();
@@ -292,6 +294,41 @@
     flushUIState: () => flushUiState(),
     loadUIState: async () => loadUiState(),
     clearCache: async () => ({ ok: true }),
+    configureNativePlayback: (payload) => nativeCall('configureNativePlayback', payload),
+    ensureNotificationPermission: () => nativeCall('ensureNotificationPermission'),
+    playNativePlayback: (payload) => nativeCall('playNativePlayback', payload || {}),
+    pauseNativePlayback: () => nativeCall('pauseNativePlayback'),
+    skipNativePlaybackNext: () => nativeCall('skipNativePlaybackNext'),
+    skipNativePlaybackPrevious: () => nativeCall('skipNativePlaybackPrevious'),
+    setNativePlaybackLoopMode: (payload) => nativeCall('setNativePlaybackLoopMode', payload),
+    cycleNativePlaybackLoopMode: () => nativeCall('cycleNativePlaybackLoopMode'),
+    stopNativePlayback: () => nativeCall('stopNativePlayback'),
+    seekNativePlayback: (payload) => nativeCall('seekNativePlayback', payload),
+    getNativePlaybackState: () => nativeCall('getNativePlaybackState'),
+    onNativePlaybackTrackChanged: (listener) => {
+      const plugin = nativePlugin();
+      if (!plugin?.addListener) {
+        return noopUnsubscribe;
+      }
+      const handle = plugin.addListener('nativePlaybackTrackChanged', (event) => listener(event));
+      return () => { if (handle?.remove) handle.remove(); };
+    },
+    onNativePlaybackStateChanged: (listener) => {
+      const plugin = nativePlugin();
+      if (!plugin?.addListener) {
+        return noopUnsubscribe;
+      }
+      const handle = plugin.addListener('nativePlaybackStateChanged', (event) => listener(event));
+      return () => { if (handle?.remove) handle.remove(); };
+    },
+    onNativePlaybackLoopModeChanged: (listener) => {
+      const plugin = nativePlugin();
+      if (!plugin?.addListener) {
+        return noopUnsubscribe;
+      }
+      const handle = plugin.addListener('nativePlaybackLoopModeChanged', (event) => listener(event));
+      return () => { if (handle?.remove) handle.remove(); };
+    },
     syncthingGetInfo: () => nativeCall('syncthingGetInfo'),
     syncthingAddDevice: (payload) => nativeCall('syncthingAddDevice', payload),
     onSyncUpdated: (listener) => {
