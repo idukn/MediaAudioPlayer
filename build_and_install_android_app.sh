@@ -130,20 +130,12 @@ export ANDROID_SDK_ROOT="$ANDROID_SDK"
 export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
 
 SYNCTHING_SO="$MOBILE_DIR/plugins/media-audio-finder/android/src/main/jniLibs/arm64-v8a/libsyncthing.so"
-FFMPEG_SO="$MOBILE_DIR/plugins/media-audio-finder/android/src/main/jniLibs/arm64-v8a/libffmpeg.so"
-FFMPEG_DEP="$MOBILE_DIR/plugins/media-audio-finder/android/src/main/jniLibs/arm64-v8a/libytdavdevice62.so"
 APP_JNI_DIR="$ANDROID_DIR/app/src/main/jniLibs/arm64-v8a"
 APP_SYNCTHING_SO="$APP_JNI_DIR/libsyncthing.so"
-APP_FFMPEG_SO="$APP_JNI_DIR/libffmpeg.so"
 
 if [[ ! -f "$SYNCTHING_SO" ]]; then
   echo "Fetching Android Syncthing binary (first time)..."
   "$SCRIPT_DIR/scripts/build-syncthing-android.sh"
-fi
-
-if [[ ! -f "$FFMPEG_SO" || ! -f "$FFMPEG_DEP" ]]; then
-  echo "Fetching Android ffmpeg bundle (first time)..."
-  "$SCRIPT_DIR/scripts/build-media-tools-android.sh"
 fi
 
 if [[ ! -f "$SYNCTHING_SO" ]]; then
@@ -152,26 +144,25 @@ if [[ ! -f "$SYNCTHING_SO" ]]; then
   exit 1
 fi
 
-if [[ ! -f "$FFMPEG_SO" || ! -f "$FFMPEG_DEP" ]]; then
-  echo "Error: ffmpeg jni bundle missing (libffmpeg.so / libytdavdevice62.so)"
-  echo "Run: ./scripts/build-media-tools-android.sh"
-  exit 1
-fi
-
 bundle_native_libs() {
   local plugin_jni="$MOBILE_DIR/plugins/media-audio-finder/android/src/main/jniLibs/arm64-v8a"
-  mkdir -p "$APP_JNI_DIR"
-  cp "$SYNCTHING_SO" "$APP_SYNCTHING_SO"
-  chmod +x "$APP_SYNCTHING_SO"
+  mkdir -p "$APP_JNI_DIR" "$plugin_jni"
   shopt -s nullglob
   for lib in "$plugin_jni"/*.so; do
     base="$(basename "$lib")"
     [[ "$base" == "libsyncthing.so" ]] && continue
-    cp -f "$lib" "$APP_JNI_DIR/$base"
+    rm -f "$lib"
+  done
+  for lib in "$APP_JNI_DIR"/*.so; do
+    rm -f "$lib"
   done
   shopt -u nullglob
-  chmod +x "$APP_FFMPEG_SO" 2>/dev/null || true
-  echo "Bundled native libs into $APP_JNI_DIR"
+  if [[ "$SYNCTHING_SO" != "$plugin_jni/libsyncthing.so" ]]; then
+    cp "$SYNCTHING_SO" "$plugin_jni/libsyncthing.so"
+  fi
+  cp "$SYNCTHING_SO" "$APP_SYNCTHING_SO"
+  chmod +x "$APP_SYNCTHING_SO" "$plugin_jni/libsyncthing.so"
+  echo "Bundled libsyncthing.so only (removed legacy ffmpeg jniLibs)"
 }
 
 if ! command -v node >/dev/null 2>&1; then
@@ -219,15 +210,12 @@ fi
 
 apk_contains_native_libs() {
   local apk="$1"
-  unzip -l "$apk" 2>/dev/null | grep -F 'lib/arm64-v8a/libsyncthing.so' >/dev/null \
-    && unzip -l "$apk" 2>/dev/null | grep -F 'lib/arm64-v8a/libffmpeg.so' >/dev/null \
-    && unzip -l "$apk" 2>/dev/null | grep -F 'lib/arm64-v8a/libytdavdevice62.so' >/dev/null \
-    && unzip -l "$apk" 2>/dev/null | grep -F 'lib/arm64-v8a/libytdzlib1.so' >/dev/null
+  unzip -l "$apk" 2>/dev/null | grep -F 'lib/arm64-v8a/libsyncthing.so' >/dev/null
 }
 
 if ! apk_contains_native_libs "$APK_PATH"; then
-  echo "Build failed: APK is missing libsyncthing.so or libffmpeg.so."
-  echo "Re-run: ./scripts/build-syncthing-android.sh && ./scripts/build-media-tools-android.sh && ./build_and_install_android_app.sh"
+  echo "Build failed: APK is missing libsyncthing.so."
+  echo "Re-run: ./scripts/build-syncthing-android.sh && ./build_and_install_android_app.sh"
   exit 1
 fi
 

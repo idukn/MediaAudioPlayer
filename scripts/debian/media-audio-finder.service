@@ -1,0 +1,14 @@
+[Unit]
+Description=Media Audio Finder HTTP server (yt-dlp live pipe)
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/media-audio-finder-server/.env
+WorkingDirectory=%h/media-audio-finder-server
+ExecStart=/usr/bin/node %h/media-audio-finder-server/bin/serve.js
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

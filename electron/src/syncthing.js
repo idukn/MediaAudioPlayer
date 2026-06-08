@@ -8,6 +8,76 @@ const { app } = require('electron');
 
 const VERSION = 'v1.27.6';
 const FOLDER_ID = 'yt-audio-app-sync';
+const PRIMARY_DEVICE_FILE = '.sync-primary-device-id';
+const SYNC_EXCLUDED_NAMES = [
+  '.ui-state.json',
+  'ui-state.json',
+  '.search-cache',
+  'search-cache.json',
+  'queries.json',
+  'metadata.json',
+  '.preview-cache',
+  '.stream-work',
+];
+
+const STIGNORE_CONTENT = `// Local-only cache and UI state (not synced)
+.ui-state.json
+ui-state.json
+.search-cache
+search-cache.json
+queries.json
+metadata.json
+.preview-cache
+.stream-work
+`;
+
+async function writeStignore(libraryPath) {
+  await fsPromises.mkdir(libraryPath, { recursive: true });
+  await fsPromises.writeFile(path.join(libraryPath, '.stignore'), STIGNORE_CONTENT, 'utf8');
+}
+
+async function readSmallTextFile(filePath) {
+  try {
+    return await fsPromises.readFile(filePath, 'utf8');
+  } catch {
+    return '';
+  }
+}
+
+async function deleteRecursively(targetPath) {
+  await fsPromises.rm(targetPath, { recursive: true, force: true });
+}
+
+async function ensurePrimaryDeviceMarker(libraryPath, myId) {
+  if (!myId) {
+    return;
+  }
+  const markerPath = path.join(libraryPath, PRIMARY_DEVICE_FILE);
+  const existing = (await readSmallTextFile(markerPath)).trim();
+  if (!existing) {
+    await fsPromises.writeFile(markerPath, myId.trim(), 'utf8');
+  }
+}
+
+async function cleanupNonPrimaryCache(libraryPath, myId) {
+  if (!myId) {
+    return;
+  }
+  const primaryId = (await readSmallTextFile(path.join(libraryPath, PRIMARY_DEVICE_FILE))).trim();
+  if (!primaryId || primaryId === myId) {
+    return;
+  }
+  console.log('[Syncthing] Removing non-primary cache on secondary device');
+  for (const name of SYNC_EXCLUDED_NAMES) {
+    await deleteRecursively(path.join(libraryPath, name));
+  }
+}
+
+async function ensureSyncExclusions(libraryPath, myId) {
+  await writeStignore(libraryPath);
+  await ensurePrimaryDeviceMarker(libraryPath, myId);
+  await cleanupNonPrimaryCache(libraryPath, myId);
+}
 const DEVICE_ID_CHARS = /^[A-Z2-7]+$/;
 const DEVICE_ID_GROUPED_RE = /^[A-Z2-7]{7}(?:-[A-Z2-7]{7}){6,7}$/;
 
@@ -379,6 +449,9 @@ class SyncthingManager {
   async bootstrap(saveDir) {
     await this.ensureReady();
     await this.ensureFolder(saveDir);
+    const status = await this.apiRequest('GET', '/rest/system/status');
+    const myID = status.myID || status.deviceID || '';
+    await ensureSyncExclusions(saveDir, myID);
     await this.waitForApi();
     return this.runStartupSync();
   }
@@ -474,6 +547,13 @@ class SyncthingManager {
       await this.apiRequest('POST', '/rest/system/restart');
       console.log('[Syncthing] Restarting to apply folder config...');
       // Re-read config will happen on manual start or it might stay alive
+      try {
+        const status = await this.apiRequest('GET', '/rest/system/status');
+        const myID = status.myID || status.deviceID || '';
+        await ensureSyncExclusions(saveDir, myID);
+      } catch (err) {
+        console.warn('[Syncthing] ensureSyncExclusions failed:', err.message);
+      }
     } else {
       // Ensure path is updated if saveDir changed
       const folder = config.folders.find(f => f.id === folderId);
@@ -483,6 +563,13 @@ class SyncthingManager {
         await this.setConfig(config);
         await this.apiRequest('POST', '/rest/system/restart');
       }
+    }
+    try {
+      const status = await this.apiRequest('GET', '/rest/system/status');
+      const myID = status.myID || status.deviceID || '';
+      await ensureSyncExclusions(saveDir, myID);
+    } catch (err) {
+      console.warn('[Syncthing] ensureSyncExclusions failed:', err.message);
     }
   }
 

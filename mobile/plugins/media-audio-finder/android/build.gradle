@@ -34,4 +34,9 @@ dependencies {
     implementation project(':capacitor-android')
     implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
     implementation 'org.nanohttpd:nanohttpd:2.3.1'
+    def media3 = '1.4.1'
+    implementation "androidx.media3:media3-exoplayer:${media3}"
+    implementation "androidx.media3:media3-session:${media3}"
+    implementation "androidx.media3:media3-ui:${media3}"
+    implementation 'androidx.media:media:1.7.0'
 }

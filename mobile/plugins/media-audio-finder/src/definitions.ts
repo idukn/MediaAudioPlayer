@@ -21,6 +21,12 @@ export interface MediaAudioFinderPlugin {
   openExternal(options: { url: string }): Promise<void>;
   writeClipboardText(options: { text: string }): Promise<void>;
   getAudioServerPort(): Promise<{ port: number }>;
+  getMediaServerConfig(): Promise<{
+    port: number;
+    androidLibraryRoot: string;
+    vmLibraryRoot: string;
+  }>;
+  getMediaToolsDiagnostics(): Promise<Record<string, unknown>>;
   syncthingGetInfo(): Promise<Record<string, unknown>>;
   syncthingAddDevice(options: { deviceID: string }): Promise<Record<string, unknown>>;
 }
