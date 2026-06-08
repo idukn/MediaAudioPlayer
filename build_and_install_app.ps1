@@ -129,14 +129,95 @@ if (-not (Test-Path $BuiltAppPath)) {
 
 # Install to LocalAppData\Programs
 $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\$AppName"
+$ExeFileName = "$AppName.exe"
 
 Write-Host "Installing app to $InstallDir..."
-if (Test-Path $InstallDir) {
-    Remove-Item -Recurse -Force $InstallDir
+
+function Stop-InstalledApp {
+    param([string]$TargetDir)
+
+    & taskkill /F /FI "IMAGENAME eq $ExeFileName" /T 2>$null | Out-Null
+
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.ExecutablePath -and
+            $_.ExecutablePath.StartsWith($TargetDir, [StringComparison]::OrdinalIgnoreCase)
+        } |
+        ForEach-Object {
+            Write-Host "Stopping PID $($_.ProcessId): $($_.Name)"
+            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+
+    Start-Sleep -Seconds 3
 }
 
-New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-Copy-Item -Recurse -Force "$BuiltAppPath\*" $InstallDir
+function Sync-InstallDir {
+    param(
+        [string]$SourceDir,
+        [string]$TargetDir
+    )
+
+    New-Item -ItemType Directory -Force -Path $TargetDir | Out-Null
+
+    Write-Host "Syncing app files in place..."
+    & robocopy $SourceDir $TargetDir /MIR /R:2 /W:2 /NFL /NDL /NJH /NJS /NC /NS /NP | Out-Null
+    $RobocopyExit = $LASTEXITCODE
+
+    if ($RobocopyExit -ge 8) {
+        Write-Error "Failed to sync app files (robocopy exit code $RobocopyExit)."
+        exit 1
+    }
+
+    if ($RobocopyExit -ge 2) {
+        Write-Host "Some files are still in use. Close '$AppName' and run this script again to finish updating."
+    }
+}
+
+function Install-AppToTarget {
+    param(
+        [string]$SourceDir,
+        [string]$TargetDir
+    )
+
+    Stop-InstalledApp -TargetDir $TargetDir
+
+    if (-not (Test-Path $TargetDir)) {
+        New-Item -ItemType Directory -Force -Path $TargetDir | Out-Null
+        Copy-Item -Recurse -Force "$SourceDir\*" $TargetDir
+        return
+    }
+
+    for ($Attempt = 1; $Attempt -le 3; $Attempt++) {
+        try {
+            Remove-Item -Recurse -Force $TargetDir -ErrorAction Stop
+            New-Item -ItemType Directory -Force -Path $TargetDir | Out-Null
+            Copy-Item -Recurse -Force "$SourceDir\*" $TargetDir
+            return
+        } catch {
+            if ($Attempt -lt 3) {
+                Write-Host "Install directory is locked, retrying... ($Attempt/3)"
+                Stop-InstalledApp -TargetDir $TargetDir
+            }
+        }
+    }
+
+    $BackupName = "$(Split-Path $TargetDir -Leaf).old_$(Get-Date -Format 'yyyyMMddHHmmss')"
+    Write-Host "Install directory is locked; renaming old install to $BackupName..."
+    try {
+        Rename-Item -Path $TargetDir -NewName $BackupName -ErrorAction Stop
+        New-Item -ItemType Directory -Force -Path $TargetDir | Out-Null
+        Copy-Item -Recurse -Force "$SourceDir\*" $TargetDir
+
+        $BackupDir = Join-Path (Split-Path $TargetDir -Parent) $BackupName
+        Remove-Item -Recurse -Force $BackupDir -ErrorAction SilentlyContinue
+        return
+    } catch {
+        Write-Host "Rename failed; falling back to in-place sync..."
+        Sync-InstallDir -SourceDir $SourceDir -TargetDir $TargetDir
+    }
+}
+
+Install-AppToTarget -SourceDir $BuiltAppPath -TargetDir $InstallDir
 
 Write-Host "Creating Start Menu shortcut..."
 $WshShell = New-Object -comObject WScript.Shell
