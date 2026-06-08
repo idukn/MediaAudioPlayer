@@ -92,6 +92,7 @@ function getExecutableCandidates(name) {
   const binaryName = `${name}${ext}`;
 
   return [
+    path.join(path.dirname(process.execPath), binaryName),
     path.join(winLocal, 'Programs', name, binaryName),
     path.join(winProgramFiles, name, binaryName),
     path.join(winProgramFilesX86, name, binaryName),
