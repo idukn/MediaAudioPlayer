@@ -749,15 +749,15 @@ function startAudioServer() {
           return res.status(500).send('Dependencies missing');
         }
 
-        const transcodeProfile = await resolvePreviewTranscodeProfile(ffmpeg);
-        res.setHeader('Content-Type', transcodeProfile.contentType);
+        // Use MP3 over chunked HTTP as it is broadly supported by Chromium audio element.
+        res.setHeader('Content-Type', 'audio/mpeg');
         res.setHeader('Transfer-Encoding', 'chunked');
         res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
         res.setHeader('Pragma', 'no-cache');
         res.setHeader('Expires', '0');
 
         console.log('[Audio Server] Spawning yt-dlp to ffmpeg pipe for URL:', url);
-        logStreamDebug('[ProxyStream] spawn', { ytdlp, ffmpeg, profileId: transcodeProfile.id });
+        logStreamDebug('[ProxyStream] spawn', { ytdlp, ffmpeg });
         const streamWorkDir = getStreamWorkDir();
         logStreamDebug('[ProxyStream] workdir', { streamWorkDir });
         
@@ -767,6 +767,7 @@ function startAudioServer() {
           '--no-playlist',
           '--no-warnings',
           '-q',
+          '--downloader', 'ffmpeg',
           '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
           url
         ], {
@@ -776,11 +777,14 @@ function startAudioServer() {
         ff = spawn(ffmpeg, [
           '-hide_banner',
           '-loglevel', 'error',
-          '-fflags', '+nobuffer',
           '-i', 'pipe:0',
           '-vn',
           '-map_metadata', '-1',
-          ...transcodeProfile.ffmpegArgs,
+          '-c:a', 'libmp3lame',
+          '-q:a', '4',
+          '-id3v2_version', '0',
+          '-write_xing', '0',
+          '-f', 'mp3',
           '-y',
           'pipe:1'
         ], {
