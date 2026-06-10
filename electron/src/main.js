@@ -646,17 +646,54 @@ function startAudioServer() {
       };
 
       const contentType = mimeTypes[ext] || 'audio/mpeg';
+      const fileSize = stat.size;
       res.setHeader('Content-Type', contentType);
-      res.setHeader('Content-Length', stat.size);
       res.setHeader('Accept-Ranges', 'bytes');
-      // Disable caching to prevent playback issues
       res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
       res.setHeader('Pragma', 'no-cache');
       res.setHeader('Expires', '0');
 
+      const rangeHeader = req.headers.range;
+      if (rangeHeader) {
+        const match = /^bytes=(\d*)-(\d*)$/i.exec(String(rangeHeader).trim());
+        if (match) {
+          let start = match[1] ? Number.parseInt(match[1], 10) : 0;
+          let end = match[2] ? Number.parseInt(match[2], 10) : fileSize - 1;
+          if (!Number.isFinite(start) || start < 0) {
+            start = 0;
+          }
+          if (!Number.isFinite(end) || end >= fileSize) {
+            end = fileSize - 1;
+          }
+          if (start <= end) {
+            const chunkSize = end - start + 1;
+            res.status(206);
+            res.setHeader('Content-Range', `bytes ${start}-${end}/${fileSize}`);
+            res.setHeader('Content-Length', chunkSize);
+            console.log('[Audio Server] Serving range:', {
+              file: path.basename(realPath),
+              start,
+              end,
+              chunkSize,
+            });
+            const stream = fs.createReadStream(realPath, { start, end });
+            stream.pipe(res);
+            stream.on('error', (err) => {
+              console.error('[Audio Server] Stream error:', err.message);
+              if (!res.headersSent) {
+                res.status(500).send('Server Error');
+              }
+            });
+            return;
+          }
+        }
+      }
+
+      res.setHeader('Content-Length', fileSize);
+
       console.log('[Audio Server] Serving:', {
         file: path.basename(realPath),
-        size: stat.size,
+        size: fileSize,
         mimeType: contentType,
         ext: ext
       });

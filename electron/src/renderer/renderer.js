@@ -544,10 +544,51 @@ function playbackLog(event, data = {}) {
 }
 
 function buildAudioUrl(fullPath) {
+  const cacheBust = Date.now();
   if (typeof window.api.buildLocalAudioUrl === 'function') {
-    return window.api.buildLocalAudioUrl(fullPath);
+    const url = window.api.buildLocalAudioUrl(fullPath);
+    if (typeof url === 'string' && url) {
+      const joiner = url.includes('?') ? '&' : '?';
+      return `${url}${joiner}t=${cacheBust}`;
+    }
   }
-  return `http://127.0.0.1:${audioServerPort}/audio?path=${encodeURIComponent(fullPath)}&t=${Date.now()}`;
+  return `http://127.0.0.1:${audioServerPort}/audio?path=${encodeURIComponent(fullPath)}&t=${cacheBust}`;
+}
+
+function isDirectAudioPlayableUrl(url) {
+  const value = String(url || '').trim().toLowerCase();
+  if (!value.startsWith('http://') && !value.startsWith('https://')) {
+    return true;
+  }
+  if (value.includes('.m3u8') || value.includes('/hls') || value.includes('application/vnd.apple.mpegurl')) {
+    return false;
+  }
+  if (value.includes('domand.nicovideo.jp') || value.includes('nicovideo.jp/hls')) {
+    return false;
+  }
+  return true;
+}
+
+async function resolvePreviewPlaybackUrl(webpageUrl) {
+  await ensureAudioServerReady();
+  if (typeof window.api.getPreviewStreamUrl === 'function') {
+    try {
+      let directUrl = await window.api.getPreviewStreamUrl({
+        url: webpageUrl,
+        quality: streamPlaybackQuality,
+      });
+      if (directUrl && typeof directUrl === 'object' && directUrl.streamUrl) {
+        directUrl = directUrl.streamUrl;
+      }
+      if (typeof directUrl === 'string' && isDirectAudioPlayableUrl(directUrl)) {
+        return directUrl;
+      }
+      console.warn('[Audio] direct stream URL is not playable in audio element, using proxy:', directUrl?.slice?.(0, 120));
+    } catch (error) {
+      console.warn('[Audio] direct preview URL failed, using proxy:', error);
+    }
+  }
+  return `http://127.0.0.1:${audioServerPort}/stream?url=${encodeURIComponent(webpageUrl)}&quality=${encodeURIComponent(streamPlaybackQuality)}&t=${Date.now()}`;
 }
 
 async function resolveAudioUrl(fullPath) {
@@ -644,6 +685,8 @@ async function playAudioFromUrl(url, { timeoutMs = 30000 } = {}) {
   }
   prepareAudioPlayerForPlayback();
   audioPlayer.pause();
+  audioPlayer.removeAttribute('src');
+  audioPlayer.load();
   audioPlayer.src = url;
   audioPlayer.load();
   nativePlaybackActive = false;
@@ -1081,12 +1124,11 @@ async function reconnectStreamAtCurrentQuality(resumeAt) {
   if (!item?.webpageUrl) {
     return;
   }
-  const previewUrl = await window.api.getPreviewStreamUrl({
-    url: item.webpageUrl,
-    quality: streamPlaybackQuality,
-  });
+  const previewUrl = await resolvePreviewPlaybackUrl(item.webpageUrl);
   prepareAudioPlayerForPlayback();
   audioPlayer.pause();
+  audioPlayer.removeAttribute('src');
+  audioPlayer.load();
   audioPlayer.src = previewUrl;
   audioPlayer.load();
   await waitForAudioCanPlay(90000);
@@ -1168,18 +1210,7 @@ async function playYoutubePreviewStream(webpageUrl, { statusPrefix = '▶️ 再
       } else {
         setStatus(`⏳ 再試行中 (${attempt}/${maxAttempts})…`);
       }
-      let previewUrl;
-      if (typeof window.api.getPreviewStreamUrl === 'function') {
-        previewUrl = await window.api.getPreviewStreamUrl({
-          url: webpageUrl,
-          quality: streamPlaybackQuality,
-        });
-        if (previewUrl && typeof previewUrl === 'object' && previewUrl.streamUrl) {
-          previewUrl = previewUrl.streamUrl;
-        }
-      } else {
-        previewUrl = `http://127.0.0.1:${audioServerPort}/stream?url=${encodeURIComponent(webpageUrl)}&quality=${encodeURIComponent(streamPlaybackQuality)}`;
-      }
+      let previewUrl = await resolvePreviewPlaybackUrl(webpageUrl);
       await playAudioFromUrl(previewUrl, { timeoutMs: 90000 });
       setNowPlayingText(title);
       setStatus(`${statusPrefix}: ${title}`);
@@ -1494,15 +1525,15 @@ function toStorageLibraryPath(fullPath) {
 
 function toPlaylistItemFromLocalPath(fullPath) {
   const entry = localFiles.find((file) => file.fullPath === fullPath);
-  const storagePath = toStorageLibraryPath(fullPath) || fullPath;
+  const normalizedPath = String(fullPath || '').replace(/\\/g, '/');
   return {
     type: 'local',
-    title: entry?.name || fullPath.split(/[/\\]/).pop() || '(No title)',
+    title: entry?.name || normalizedPath.split('/').pop() || '(No title)',
     uploader: 'Local File',
     duration: '-',
     durationSec: null,
     site: 'Local',
-    fullPath: storagePath,
+    fullPath: normalizedPath,
   };
 }
 
@@ -1653,8 +1684,13 @@ async function resolveLocalPlaybackPath(item) {
     return null;
   }
 
-  const fullPath = normalized.fullPath;
-  const libraryRoot = String(baseAudioDir || '').trim();
+  const fullPath = String(normalized.fullPath).replace(/\\/g, '/');
+  const libraryRoot = String(baseAudioDir || '').trim().replace(/\\/g, '/');
+
+  if (isAbsoluteLibraryPath(fullPath) && libraryRoot
+    && (fullPath === libraryRoot || fullPath.startsWith(`${libraryRoot}/`))) {
+    return fullPath;
+  }
 
   if (!isAbsoluteLibraryPath(fullPath) && libraryRoot) {
     const relKey = fullPath.replace(/^[/\\]+/, '').toLowerCase();
@@ -1708,7 +1744,8 @@ async function resolveLocalPlaybackPath(item) {
   }
 
   const baseKey = fullPath.split(/[/\\]/).pop()?.toLowerCase();
-  if (baseKey && byName.has(baseKey)) {
+  const hasPathSeparator = fullPath.includes('/') || fullPath.includes('\\');
+  if (baseKey && !hasPathSeparator && byName.has(baseKey)) {
     return byName.get(baseKey);
   }
 
