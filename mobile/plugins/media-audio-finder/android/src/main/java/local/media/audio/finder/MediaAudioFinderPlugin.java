@@ -136,6 +136,20 @@ public class MediaAudioFinderPlugin extends Plugin {
     }
 
     @Override
+    protected void handleOnResume() {
+        super.handleOnResume();
+        MediaServerBootstrap bootstrap = MediaServerBootstrap.getInstance(getContext());
+        bootstrap.attachActivity(getActivity());
+        bootstrap.startBackground();
+    }
+
+    @Override
+    protected void handleOnPause() {
+        MediaServerBootstrap.getInstance(getContext()).detachActivity();
+        super.handleOnPause();
+    }
+
+    @Override
     protected void handleOnDestroy() {
         if (libraryObserver != null) {
             libraryObserver.stopWatching();
@@ -580,6 +594,24 @@ public class MediaAudioFinderPlugin extends Plugin {
         ret.put("vmLibraryRoot", DEFAULT_VM_LIBRARY_ROOT);
         ret.put("localAudioPort", LocalAudioHttpServer.DEFAULT_PORT);
         call.resolve(ret);
+    }
+
+    @PluginMethod
+    public void ensureMediaServerReady(PluginCall call) {
+        new Thread(() -> {
+            MediaServerBootstrap bootstrap = MediaServerBootstrap.getInstance(getContext());
+            boolean ready = bootstrap.ensureReady(40, 500);
+            if (!ready) {
+                call.reject(
+                    "Debian メディアサーバー (127.0.0.1:" + MEDIA_SERVER_PORT + ") に接続できません。"
+                        + " Terminal で setup-debian-media-server.sh を実行し、ポート "
+                        + MEDIA_SERVER_PORT
+                        + " の転送を許可してください。"
+                );
+                return;
+            }
+            call.resolve(bootstrap.probeHealthDetails());
+        }, "ensure-media-server").start();
     }
 
     @PluginMethod

@@ -716,43 +716,13 @@ final class NativePlaybackManager implements Player.Listener {
 
     private void queryMediaServerReachable(Consumer<Boolean> callback) {
         networkExecutor.execute(() -> {
-            boolean reachable = probeMediaServerHealth();
+            MediaServerBootstrap bootstrap = MediaServerBootstrap.getInstance(appContext);
+            boolean reachable = bootstrap.probeHealth();
+            if (!reachable) {
+                bootstrap.launchTerminalIfNeeded();
+            }
             handler.post(() -> callback.accept(reachable));
         });
-    }
-
-    private boolean probeMediaServerHealth() {
-        HttpURLConnection connection = null;
-        try {
-            String healthUrl = "http://127.0.0.1:" + MediaAudioFinderPlugin.MEDIA_SERVER_PORT + "/health";
-            connection = (HttpURLConnection) new URL(healthUrl).openConnection();
-            connection.setConnectTimeout(1500);
-            connection.setReadTimeout(1500);
-            connection.setRequestMethod("GET");
-            int code = connection.getResponseCode();
-            if (code == HttpURLConnection.HTTP_OK) {
-                return true;
-            }
-            PlaybackLog.warn(
-                "media server health unexpected status",
-                PlaybackLog.with("code", code)
-            );
-            return false;
-        } catch (Exception e) {
-            PlaybackLog.warn(
-                "media server health probe failed",
-                PlaybackLog.put(
-                    PlaybackLog.put(PlaybackLog.fields(), "error", e.getClass().getSimpleName()),
-                    "message",
-                    String.valueOf(e.getMessage())
-                )
-            );
-            return false;
-        } finally {
-            if (connection != null) {
-                connection.disconnect();
-            }
-        }
     }
 
     void deliverPlaybackState(Consumer<JSObject> consumer) {

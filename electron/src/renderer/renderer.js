@@ -3212,6 +3212,11 @@ async function boot() {
         console.warn('[Boot] notification permission request failed:', error);
       }
     }
+    if (typeof window.api.ensureMediaServerReady === 'function') {
+      void window.api.ensureMediaServerReady().catch((error) => {
+        console.warn('[Boot] media server bootstrap failed:', error);
+      });
+    }
   }
   baseAudioDir = libraryDir;
   if (libraryPathEl) {

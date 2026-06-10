@@ -26,6 +26,7 @@ export interface MediaAudioFinderPlugin {
     androidLibraryRoot: string;
     vmLibraryRoot: string;
   }>;
+  ensureMediaServerReady(): Promise<Record<string, unknown>>;
   getMediaToolsDiagnostics(): Promise<Record<string, unknown>>;
   syncthingGetInfo(): Promise<Record<string, unknown>>;
   syncthingAddDevice(options: { deviceID: string }): Promise<Record<string, unknown>>;

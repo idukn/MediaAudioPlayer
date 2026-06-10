@@ -130,6 +130,21 @@
   }
 
   async function ensureMediaServerReady() {
+    if (window.Capacitor?.getPlatform?.() === 'android') {
+      try {
+        const res = await nativeCall('ensureMediaServerReady');
+        if (res?.libraryRoot) {
+          cachedMediaServerConfig = {
+            ...(cachedMediaServerConfig || {}),
+            port: Number(res.port) || DEFAULT_MEDIA_SERVER_PORT,
+            vmLibraryRoot: String(res.libraryRoot),
+          };
+        }
+        return cachedMediaServerConfig || getMediaServerConfig();
+      } catch (err) {
+        throw new Error(String(err?.message || err || 'Debian メディアサーバーに接続できません'));
+      }
+    }
     const cfg = await getMediaServerConfig();
     const response = await fetch(`${mediaServerBaseUrl(cfg.port)}/health`);
     let data = null;
